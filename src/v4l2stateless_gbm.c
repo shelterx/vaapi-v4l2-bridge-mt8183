@@ -1,19 +1,29 @@
 /*
  * v4l2stateless_gbm.c — GBM-backed display surfaces.
  *
- * The VPU capture buffers must never be exported (EXPBUF + GPU import is a
- * RK3588 CMA/IOMMU hang). Instead every exported decode surface gets a
- * driver-owned linear GBM bo on the render node (panthor shmem: ordinary
- * system memory). pull_capture copies each decoded frame into it; the
- * export path hands out the classic single-object NV12 dmabuf descriptor
- * (Y at offset 0, UV at offset stride*h) that Chromium's zero-copy GL
- * path requires (vaapi_wrapper rejects num_objects != 1).
+ * Why a GBM bo instead of exporting the capture buffer: the MT8183
+ * decoder (/dev/video5) outputs only tiled MM21, which the GL/ANGLE
+ * sampler cannot read as NV12. (EXPBUF of the capture CMA itself works
+ * fine on MT8183 — the earlier EINVAL was a debug artifact; see
+ * docs/mt8183-notes.md §9 — but it would hand the GPU the raw tiled
+ * plane, which is exactly the bug that caused the green/violet flicker.)
+ * So pull_capture de-tiles MM21 -> NV12 and copies the frame into a
+ * driver-owned linear GBM bo on the render node; the export path hands
+ * out that single-object NV12 dmabuf descriptor (Y at offset 0, UV at
+ * offset stride*h) that Chromium's zero-copy GL path requires
+ * (vaapi_wrapper rejects num_objects != 1).
+ * (Historical note: this file exists because on the original RK3588
+ * target the VPU capture CMA could not be EXPBUF'd at all — it hung —
+ * so a GBM bo was the only exportable buffer from the start.)
  *
- * Platform notes (verified by tests/gbm_probe.c on this box):
- *   - panthor refuses multiplanar YUV gbm bos, so the bo is R8 geometry
- *     with h + ceil(h/2) rows and the NV12 planes live at byte offsets
- *   - Mesa 26.0.8 per-plane GR88 import samples black; never hand out a
- *     GR88-only image as the primary shape
+ * Platform notes:
+ *   - The bo is R8 geometry with h + ceil(h/2) rows and the NV12 planes
+ *     live at byte offsets, because the render node refuses multiplanar
+ *     YUV gbm bos (tests/gbm_probe.c; that probe ran on the RK3588 box
+ *     with panthor/Mesa 26.0.8, and the R8 shape is what real Chromium
+ *     playback uses on this Mali-G72 box).
+ *   - Never hand out a GR88-only image as the primary shape: Mesa
+ *     per-plane GR88 dmabuf import samples black.
  */
 #include <stdio.h>
 #include <stdlib.h>
