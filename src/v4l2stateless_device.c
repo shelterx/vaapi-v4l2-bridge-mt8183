@@ -1575,13 +1575,16 @@ int v4l2sl_claim_capture_for_export(struct v4l2sl_context *ctx,
     w = ctx->width > 0 ? ctx->width : (int)surf->width;
     h = ctx->height > 0 ? ctx->height : (int)surf->height;
     fourcc = ctx->cap_pixelformat ? ctx->cap_pixelformat : V4L2_PIX_FMT_NV12;
-    if (v4l2sl_ensure_capture(ctx, w, h, fourcc) < 0)
+    if (v4l2sl_ensure_capture(ctx, w, h, fourcc) < 0) {
+        fprintf(stderr, "v4l2stateless: claim capture: setup failed surf=%u\n",
+                (unsigned)surf->surface_id);
         return -1;
+    }
     if (surf->buf_index >= 0)
         return 0;
     if (ctx->n_free_cap == 0) {
-        v4l2sl_explog("v4l2stateless: claim capture: no free slot surf=%u\n",
-                      (unsigned)surf->surface_id);
+        fprintf(stderr, "v4l2stateless: claim capture: no free slot surf=%u\n",
+                (unsigned)surf->surface_id);
         return -1;
     }
     idx = ctx->free_cap_bufs[--ctx->n_free_cap];
