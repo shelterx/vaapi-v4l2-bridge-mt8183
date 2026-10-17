@@ -1187,6 +1187,9 @@ int v4l2sl_surface_pull_capture(struct v4l2sl_context *ctx,
 
     if (!ctx || !surf || ctx->v4l2_fd < 0 || buf_index < 0)
         return -1;
+    /* Remember which context allocated this slot so surface destroy can
+     * return it to the right pool (see destroy_surface_locked). */
+    surf->capture_owner = ctx;
     if (v4l2sl_mmap_one_capture(ctx, buf_index) < 0)
         return -1;
     if (!ctx->capture_buf_ptr[buf_index] ||
@@ -1589,6 +1592,7 @@ int v4l2sl_claim_capture_for_export(struct v4l2sl_context *ctx,
     }
     idx = ctx->free_cap_bufs[--ctx->n_free_cap];
     surf->buf_index = idx;
+    surf->capture_owner = ctx;
     surf->stride = ctx->cap_stride;
     surf->aligned_h = ctx->cap_height;
     surf->cap_fourcc = ctx->cap_pixelformat;

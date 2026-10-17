@@ -142,6 +142,12 @@ static const char *cached_device(struct v4l2sl_driver_data *dd, enum v4l2sl_code
 
 static void destroy_surface_locked(struct v4l2sl_driver_data *dd,
                                    struct v4l2sl_surface *s, VASurfaceID id);
+static struct v4l2sl_context *context_owning_capture(struct v4l2sl_driver_data *dd,
+                                                      struct v4l2sl_surface *surf);
+static struct v4l2sl_context *context_for_surface(struct v4l2sl_driver_data *dd,
+                                                  VASurfaceID surface);
+static int v4l2sl_context_is_alive(struct v4l2sl_driver_data *dd,
+                                   struct v4l2sl_context *c);
 
 static VAStatus
 v4l2sl_terminate(VADriverContextP ctx)
@@ -777,10 +783,38 @@ destroy_surface_locked(struct v4l2sl_driver_data *dd,
     if (s->expbuf_fd >= 0)
         close(s->expbuf_fd);
     v4l2sl_gbm_surface_destroy(s);
+    if (s->buf_index >= 0) {
+        struct v4l2sl_context *c = NULL;
+        /* Prefer the context that actually allocated this slot (recorded at
+         * claim/decode time); fall back to the exact render-target owner.
+         * Never guess "any live VLD context": a slot from a larger pool must
+         * not be pushed into a smaller one, which would surface as
+         * EINVAL/EBUSY on the surviving stream's next QBUF. */
+        if (s->capture_owner && v4l2sl_context_is_alive(dd, s->capture_owner))
+            c = s->capture_owner;
+        else
+            c = context_for_surface(dd, s->surface_id);
+        /* The free pool is bounded per-context on capture_bufs_allocd; only
+         * return a slot this context actually allocated and still maps. The
+         * push is duplicate-free, so a re-push after rebuild is a no-op. */
+        if (c && s->buf_index < c->capture_bufs_allocd &&
+            c->capture_buf_ptr[s->buf_index] &&
+            c->capture_buf_ptr[s->buf_index] != MAP_FAILED)
+            v4l2sl_cap_pool_push(c, s->buf_index);
+    }
     free(s->cpu_ptr);
     free(s);
     dd->surfaces[id] = NULL;
     v4l2sl_surface_id_push(dd, id);
+}
+
+static int
+v4l2sl_context_is_alive(struct v4l2sl_driver_data *dd, struct v4l2sl_context *c)
+{
+    for (struct v4l2sl_context *x = dd->contexts; x; x = x->next)
+        if (x == c)
+            return 1;
+    return 0;
 }
 
 static VAStatus
