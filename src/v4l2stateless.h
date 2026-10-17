@@ -83,6 +83,7 @@ struct v4l2sl_surface {
     VASurfaceStatus status;
     int has_pic;             /* holds a decoded picture snapshot (bo/memfd) */
     int buf_index;           /* V4L2 capture buffer index, -1 if not allocated */
+    struct v4l2sl_context *capture_owner; /* context that allocated buf_index */
     int memfd_fd;          /* memfd snapshot fd (CPU-readback vehicle) */
     uint32_t memfd_size;     /* current ftruncate size of memfd_fd (grow-only) */
     void *memfd_map;         /* persistent RW mapping of memfd_fd (grow-only) */
