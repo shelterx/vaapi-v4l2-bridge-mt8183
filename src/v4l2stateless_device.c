@@ -570,11 +570,12 @@ int v4l2sl_decode_submit(struct v4l2sl_context *ctx, int out_buf_idx,
 }
 
 /*
- * De-tile MM21 (16x32 Y / 16x16 UV tiles, row-major) -> linear NV12.
+ * De-tile MM21 (16x32 Y tiles / 8x16 chroma tiles, row-major) -> linear NV12.
  * dst is aw*ah*3/2; aw aligned to 16, ah to 32. ysrc is the Y plane
- * (y_tc*y_tr*512 bytes, 16x32 tiles) and usrc the UV plane (u_tc*u_tr*512
- * bytes, 16x16 tiles); the MT8183 driver keeps them in separate CMA blocks,
- * so they arrive as two distinct mappings. Reference: tools/mm21_detile.c.
+ * (y_tc*y_tr*512 bytes, 16x32 tiles) and usrc the UV plane (y_tc*y_tr*256
+ * bytes, 8x16 chroma-sample tiles on the SAME luma tile grid, 16 bytes per
+ * row); the MT8183 driver keeps them in separate CMA blocks, so they arrive
+ * as two distinct mappings. Reference: tools/mm21_detile.c.
  */
 static void v4l2sl_mm21_detile(const uint8_t *ysrc, const uint8_t *usrc,
                                uint8_t *dst, uint32_t aw, uint32_t ah)
