@@ -1,6 +1,6 @@
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra
-TARGETS := v4l2_fmt_test v4l2_mdp3_stream v4l2_mdp3_diag
+TARGETS := v4l2_fmt_test v4l2_mdp3_stream v4l2_mdp3_diag v4l2_m2m_jpeg
 
 all: $(TARGETS)
 
@@ -11,6 +11,9 @@ v4l2_mdp3_stream: v4l2_mdp3_stream.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 v4l2_mdp3_diag: v4l2_mdp3_diag.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+v4l2_m2m_jpeg: v4l2_m2m_jpeg.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 clean:
