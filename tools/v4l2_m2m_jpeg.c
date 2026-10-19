@@ -1,13 +1,19 @@
 // v4l2_m2m_jpeg.c
-// Standalone JPEG-encoder M2M test — a *differential* GCE probe.
+// Standalone JPEG-encoder M2M test — a *differential* M2M repro.
 //
-// Purpose: exercise the GCE (CMDQ) through a M2M client *other than* MDP3.
-// /dev/video1 (mtk-jpeg-enc) submits its jobs to the same GCE as MDP3, but
-// with a different packet shape. So:
-//   - if this M2M job COMPLETES (emits a valid JPEG) while the MDP3 M2M job
-//     hangs (0/4, see tools/v4l2_mdp3_stream.c), the bug is isolated to
-//     MDP3-specific GCE packet/completion handling;
-//   - if this one also hangs, the problem is broader (general M2M/GCE).
+// Original purpose was to exercise the GCE (CMDQ) through a M2M client *other
+// than* MDP3. THAT PREMISE IS RETRACTED: /dev/video1 (mtk-jpeg-enc) is bound
+// to the upstream mtk_jpeg driver, which completes jobs via a DIRECT hardware
+// IRQ (platform_get_irq -> mtk_jpeg_enc_irq -> JPEG_ENC_INT_STS DONE bit), NOT
+// GCE/cmdq — there are zero gce/cmdq/mailbox references in
+// drivers/media/platform/mediatek/jpeg/. See docs/mt8183-mdp3.md ("Differential
+// test: JPEG-enc M2M also hangs — but it does NOT use GCE").
+//
+// So this is NOT a GCE probe. Its value: an independent M2M repro showing a
+// second, INDEPENDENT (JPEG-specific) hang. It also hangs (0/4, DQBUF timeout
+// ~5 s), consistent with the MDP3 M2M job (tools/v4l2_mdp3_stream.c), but the
+// two do NOT share a completion path — so "both hang" does NOT imply a shared
+// M2M/GCE bug. This tool says nothing about the MDP3/GCE path.
 //
 // /dev/video1 (mtk-jpeg-enc), one fd for everything:
 //   1. S_FMT YUYV  on V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE  (device input)
@@ -21,7 +27,7 @@
 //      of the used region (b.bytesused)
 //
 // The input pixel content is irrelevant — this test only asks "does the M2M
-// GCE job complete and emit a well-formed JPEG?". A solid/noisy YUYV frame
+// job complete and emit a well-formed JPEG?". A solid/noisy YUYV frame
 // compresses to a small but valid JPEG (SOI...EOI).
 //
 // CRITICAL (same as v4l2_mdp3_stream.c): for V4L2_MEMORY_MMAP the mmap()
