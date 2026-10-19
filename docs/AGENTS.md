@@ -1,10 +1,9 @@
 
 # AGENTS.md — MT8183 work
 
-Style: read HANDOFF.md, update this file with progress as we go.
+Style: update this file with progress as we go.
 **Focused commits only (one logical change each), and do NOT commit until the
-USER says so** (no auto-commit, no big chunks). Commit subject: single line
-prefixed `mediatek: <text>`.
+USER says so** (no auto-commit, no big chunks). Commit subject: single line.
 
 ## Notes
 
@@ -131,9 +130,56 @@ prefixed `mediatek: <text>`.
   instead; `v4l2sl_surface_pull_capture` de-tiles into the memfd then
   `v4l2sl_gbm_surface_sync()` pushes the frame into that bo. Also allow MM21 in
   `v4l2sl_gbm_surface_ensure()`. Verified: Chromium plays the Norway 4K stream
-  with the correct image (593 decoded frames, clean screenshot). Commits
-  `0c527d5` (+ docs). Note: the bridge must be installed to
+  with the correct image (593 decoded frames, clean screenshot). Note: the bridge must be installed to
   `/usr/lib/aarch64-linux-gnu/dri/` for Chromium to pick it up.
+
+- 2026-10-18: export/claim error handling hardened. `v4l2sl_claim_capture_for_export`
+  failures were silent in production (only `v4l2sl_explog`, debug-gated): the
+  no-free-slot and `ensure_capture`-failed branches now `fprintf` unconditionally.
+  The ignored return at the call site (`v4l2stateless.c` export path) is an
+  intentional fallback: on claim failure the export still succeeds via the GBM
+  bo, which is self-contained (per-surface bo synced by `pull_capture`; the
+  surface does not need to be pinned to the slot — the slot-pinning invariant
+  only matters for the zero-copy EXPBUF path). `destroy_surface_locked` now
+  returns the claimed/decoded capture slot to the free pool (push is bounded and
+  duplicate-free, so re-pushing after a pool rebuild is a no-op); previously
+  claimed slots leaked for the life of the context.
+
+- 2026-10-18: **`tools/v4l2_mdp3_diag.c`** — new **read-only** MDP3/GCE evidence
+  collector (added to `tools/Makefile`). Five sections: (1) enumerate
+  `/dev/video*` + QUERYCAP, (2) `ENUM_FMT` on both MPLANE queues (no
+  S_FMT/REQBUFS/streaming — safe to run live), (3) decode the GCE DT props
+  (`mediatek,gce-client-reg`/`gce-events` are **big-endian** u32 arrays —
+  `{subsys,client,reg_base,reg_len}` / `{event,irq}`), (4) `/proc/interrupts`
+  for `mtk_cmdq`/mdp/gce with per-CPU totals + spurious, (5) filtered
+  `/dev/kmsg`. `--cmd '<shell>'` runs a workload between two IRQ snapshots and
+  prints the delta. **Finding (corrects an earlier read):** `mtk_cmdq` is
+  dominated by **background display/compositor GCE** — idle 5 s windows run
+  ~42–170 IRQs (highly variable), and a hung M2M job (5.3 s, root) measures the
+  *same* ~49–114 range with no consistent additive job signal. So the IRQ
+  count **cannot** tell us whether the MDP3 GCE thread fires during the job;
+  an earlier "hung run → +39 vs idle → +0" was a background burst (retracted).
+  The "GCE fires vs never fires" question stays **open** from userspace — only
+  a kernel build (dynamic debug/ftrace) can settle it. See
+  `docs/mt8183-mdp3.md`.
+
+- 2026-10-18: **`tools/v4l2_m2m_jpeg.c`** — standalone JPEG-enc M2M repro on
+  `/dev/video1` (mtk-jpeg-enc), YUYV in → JPEG out, verify via SOI/EOI +
+  `bytesused`. Built as a **differential test**: does a M2M client *other
+  than* MDP3 also hang? **It does** — 0/4, DQBUF timeout, ~5 s, consistent
+  (3×). On release it raises a kernel WARN (`mtk_jpeg_release` →
+  `cancel_work_sync` → `__flush_work`, workqueue.c:4287) = a stuck work item.
+  **BUT this does NOT prove a shared GCE bug:** the driver bound to
+  `video1` (`mtk-jpeg`, confirmed via
+  `/sys/class/video4linux/video1/device/driver`) is the upstream `mtk_jpeg`
+  driver, which completes jobs via a **direct HW IRQ** (`platform_get_irq` →
+  `JPEG_ENC_INT_STS` DONE bit → `v4l2_m2m_buf_done`/`v4l2_m2m_job_finish`) —
+  **zero** `gce`/`cmdq`/`mailbox` references in the whole driver. So MDP3
+  (GCE) and JPEG (HW IRQ) do **not** share a completion path; the two hangs
+  are **independent**. The JPEG hang is a separate JPEG-specific issue (its
+  1 s HW timeout should have errored the buffer, but DQBUF hung 5 s → job
+  likely never reached HW start), **not** evidence about GCE. This does
+  **not** down-weight the MDP3 PC-check hypothesis. See `docs/mt8183-mdp3.md`.
 
 ## Open (priority order)
 
@@ -159,7 +205,7 @@ prefixed `mediatek: <text>`.
   offers a tiled capture. MM21 layout (CONFIRMED, see docs/mt8183-notes.md
   §5): 16x32 Y tiles / 16x16 UV tiles, row-major — NOT 32x32/32x16.
   Reference impl: `tools/mm21_detile.c` (verified on real BBB decode).
-- **DONE: MM21 chroma de-tile fix (`0a9b7d1`)** — the chroma plane uses the
+- **DONE: MM21 chroma de-tile fix** — the chroma plane uses the
   **same tile grid as luma** (8×16 chroma samples / 256 B per tile), not a
   `aw/32` grid of 16×16 tiles. Bridge HW output is now pixel-exact vs software.
 - **DONE: Chromium H.264 HW playback works** (Norway 4K, correct image). The
@@ -171,13 +217,13 @@ prefixed `mediatek: <text>`.
   `MEDIA_REQUEST_IOC_REINIT` right after DQBUF, but the MTK worker completes
   the request (`v4l2_ctrl_request_complete`) **after**
   `v4l2_m2m_buf_done_and_job_finish` — so REINIT cleared the request's objects
-  mid-completion, corrupting its lists/refcounts and wedging the device. Fix
-  (`c01d651`): `close()` the request fd each frame instead of REINIT-ing (the
+  mid-completion, corrupting its lists/refcounts and wedging the device. Fix:
+  `close()` the request fd each frame instead of REINIT-ing (the
   kernel keeps the request alive via the buffer ref). Verified: 3 ×
   (YouTube play + kill) → ~500 frames each, device healthy, no stuck tasks;
   the old repeated-launch pattern no longer wedges it. Full writeup:
   `docs/mt8183-notes.md` §10.
-- **FIXED: `media_request_object_bind` WARNs** (`7ea290a`). The bridge put the
+- **FIXED: `media_request_object_bind` WARNs**. The bridge put the
   request fd in `ctrls->which` (`V4L2_CTRL_WHICH_REQUEST_VAL | fd`) — the old
   scheme. The kernel routes on `cs->which == V4L2_CTRL_WHICH_REQUEST_VAL`
   exactly and takes the fd from the separate `request_fd` field, so the
@@ -298,14 +344,14 @@ GOTCHAS hit (for the record):
   - `v4l2slh264dec` auto-detects the device (no `device` property).
 
 **RESOLVED (was "STILL OPEN").** The de-tile is done — the bridge de-tiles
-MM21→NV12 in `v4l2sl_surface_pull_capture` (commit `0a9b7d1`, chroma layout
+MM21→NV12 in `v4l2sl_surface_pull_capture` (chroma layout
 corrected) and exports it to Chromium as a GBM bo. MDP3 (HW de-tile) remains
 blocked on the GCE EOF bug but is no longer needed.
 
 The "Modules linked in" dmesg traces were **a real bug and are fixed**: they
 were the `media_request_object_bind` / `v4l2_ctrl_request_complete` WARNs from
 `mtk_vdec_worker`, caused by the bridge putting the request fd in `ctrls->which`
-instead of the `request_fd` field (`7ea290a`). `dmesg` is now clean. The only
+instead of the `request_fd` field. `dmesg` is now clean. The only
 residual kernel warning is a benign `__flush_work` (workqueue.c), which
 GStreamer's `v4l2slh264dec` also produces — a driver teardown quirk, not the
 bridge.

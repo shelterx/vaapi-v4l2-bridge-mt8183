@@ -77,8 +77,7 @@ de-tile**:
 
 A de-tiler would be a new function here: read MM21 tiles (tile size/order —
 see §5), scatter into a linear NV12 buffer. **Implemented** as
-`v4l2sl_mm21_detile()` in `v4l2stateless_device.c` (not in this file) —
-commits `08e2fd5` (initial) and `0a9b7d1` (chroma layout fix).
+`v4l2sl_mm21_detile()` in `v4l2stateless_device.c` (not in this file).
 
 ## 4. `v4l2stateless_probe.c` — device discovery (PARTIALLY RELEVANT)
 
@@ -285,7 +284,7 @@ forever (green/violet, with horizontal streaks). `V4L2SL_EXPBUF_EXPORT=0`
 took the GBM branch, which created the bo at export time and never re-synced
 it after the de-tile → solid green.
 
-**Fix (commit `0c527d5`):**
+**Fix:**
 - At export time, claim a capture slot (so the negotiated fourcc is known),
   and if the capture is tiled (`cap_fourcc`/`cap_pixelformat == MM21` or the
   surface was already de-tiled), export a **GBM bo** instead of the raw plane.
@@ -299,7 +298,7 @@ Verified: Chromium plays the Norway 4K YouTube stream with the correct image
 (593 decoded frames, clean screenshot). Remember to install the built `.so`
 to `/usr/lib/aarch64-linux-gnu/dri/` before testing.
 
-**Follow-up fix — chroma de-tile layout (`0a9b7d1`):** the MM21 **UV tile
+**Follow-up fix — chroma de-tile layout:** the MM21 **UV tile
 geometry** was also wrong (16×16 chroma tiles on an `aw/32` grid). The correct
 layout is the **same tile grid as luma**, each tile **8×16 chroma samples
 (16 bytes × 16 rows = 256 B)** — see §5. It only showed up on coloured content
@@ -325,8 +324,8 @@ software decode.
 
 **Status: real, reproduced several times; root cause found and fixed — see the
 "RESOLVED" subsection at the end of this section.** It was a bridge race
-(`MEDIA_REQUEST_IOC_REINIT` vs the driver completing the request); fix
-`c01d651`. The historical evidence below is kept for reference.
+(`MEDIA_REQUEST_IOC_REINIT` vs the driver completing the request); fixed.
+The historical evidence below is kept for reference.
 
 ### Symptom
 `/dev/video5` becomes permanently unusable. Every new `open("/dev/video5")`
@@ -436,7 +435,7 @@ fallback `media_request_object_bind()` (`WARN_ON(req->state != UPDATING &&
 internal lists/refcounts. That corruption is what eventually wedged
 `/dev/video5`.
 
-**Fix (`c01d651`):** stop REINIT-ing. `close()` the request fd after each frame
+**Fix:** stop REINIT-ing. `close()` the request fd after each frame
 instead — the kernel keeps the request alive via the buffer's own reference
 until the worker is done, and `v4l2sl_begin_picture()` allocates a fresh one
 next frame. No shared-request mutation ⇒ no race.
@@ -447,7 +446,7 @@ opened fine and there were no stuck `vcodec`/`m2m` tasks. Before the fix the
 same repeated-launch pattern wedged the device. (Note the `pull_capture MM21`
 frame print is behind `V4L2SL_DEBUG` now — count frames with it set.)
 
-**Also fixed the same session: the request-control WARNs (`7ea290a`).** ~42
+**Also fixed the same session: the request-control WARNs.** ~42
 `media_request_object_bind` WARNs (mc-request.c:416) appeared during playback.
 Root cause: `v4l2sl_set_request_controls()` wrote the request fd into
 `ctrls->which` (`V4L2_CTRL_WHICH_REQUEST_VAL | fd`) — the pre-UAPI scheme. The
