@@ -421,6 +421,9 @@ VAStatus v4l2sl_surface_fill_prime(const struct v4l2sl_surface *surf,
  * bo is panthor system memory kept in sync by pull_capture. */
 int v4l2sl_gbm_surface_ensure(struct v4l2sl_surface *s);
 int v4l2sl_gbm_surface_sync(struct v4l2sl_surface *s);
+int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
+                                   const uint8_t *ysrc, const uint8_t *usrc,
+                                   uint32_t aw, uint32_t ah);
 /* Lazy memfd: refill the memfd snapshot from the bo when a CPU-readback
  * caller (vaGetImage / vaDeriveImage / VPP source) needs it after a
  * bo-only pull_capture. */
