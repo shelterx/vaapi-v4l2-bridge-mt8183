@@ -181,7 +181,7 @@ static void test_h264_sps_pps(void)
     pic.pic_fields.bits.reference_pic_flag = 1;
     for (int i = 0; i < 16; i++)
         pic.ReferenceFrames[i].flags = VA_PICTURE_H264_INVALID;
-    h264_fill_decode_params(&dec, &pic, NULL, &slice);
+    h264_fill_decode_params(&dec, &pic, NULL, &sps, &slice);
     expect_true(dec.flags & V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC, "h264-idr");
     expect_true(dec.frame_num == 0, "h264-fn0");
 

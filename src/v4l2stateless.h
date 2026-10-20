@@ -477,6 +477,7 @@ void h264_fill_pps(struct v4l2_ctrl_h264_pps *pps, const VAPictureParameterBuffe
 void h264_fill_decode_params(struct v4l2_ctrl_h264_decode_params *dec,
                              const VAPictureParameterBufferH264 *pic,
                              struct v4l2sl_driver_data *dd,
+                             const struct v4l2_ctrl_h264_sps *sps,
                              const VASliceParameterBufferH264 *slice);
 void h264_fill_scaling_matrix(struct v4l2_ctrl_h264_scaling_matrix *sm,
                               const VAIQMatrixBufferH264 *iq);
