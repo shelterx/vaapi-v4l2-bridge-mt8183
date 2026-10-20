@@ -181,6 +181,42 @@ USER says so** (no auto-commit, no big chunks). Commit subject: single line.
   likely never reached HW start), **not** evidence about GCE. This does
   **not** down-weight the MDP3 PC-check hypothesis. See `docs/mt8183-mdp3.md`.
 
+- 2026-10-20: **Measured the de-tile in situ and de-tiled straight into the
+  GBM bo.** The "~1.4 ms/frame (~4%)" figure was a cached-malloc microbenchmark;
+  in the real pipeline the de-tile is **15-18 ms/frame (~45-50% of a core @30fps)**
+  because the capture planes are an **uncached CMA mapping** (bandwidth-bound).
+  Consequences, all measured at 1080p: the row-major loop reorder that was ~29%
+  faster on cached buffers is **~22% slower** in situ (sequential source reads
+  matter more than destination write locality) — reverted; `-march=native`,
+  `-mcpu=cortex-a76`, `-march=armv8.2-a+dotprod+i8mm+fp16` and LTO produce
+  identical/reorder-only codegen for the de-tiler; hand-written NEON is equal or
+  slower. **Kept:** `v4l2sl_gbm_surface_detile_mm21()` de-tiles directly into
+  the mapped bo (independent Y/UV pointers/strides, no padding-row writes);
+  interleaved A/B saved **2.7-5.0 ms/frame** vs de-tile→memfd + 1.5 ms
+  memfd→bo, and whole-browser 2-min CPU went **153.0% → 143.3%** (gpu-process
+  89.2% → 81.3%). The memfd is now a lazy readback snapshot
+  (`v4l2sl_surface_ensure_memfd`). Details: `docs/mt8183-notes.md` §13,
+  `PERF.md`.
+
+- 2026-10-20: **Fixed the blocky-artifact bug: H.264 PicNum wraparound.**
+  Symptom: deterministic macroblock artifacts on moving content, fixed
+  positions, clearing at the next IDR (720p/1080p, both this tree and the
+  upstream clone, software decode clean). Ruled out the kernel decoder
+  (GStreamer `v4l2slh264dec` is bit-identical to software on the same
+  repro clip), the de-tile, the GBM export, and DPB timestamp lookup.
+  Reproduction: 6 s 1080p x264 `bframes=3:b-pyramid=normal` diverges on
+  frames 108–124, exact elsewhere; `bframes=0` is exact. Root cause:
+  `h264_fill_dpb_entry()` used `FrameNum` as `pic_num`, but across a
+  FrameNum wrap a short-term reference ahead of the current picture has
+  `PicNum = FrameNum - MaxFrameNum` (H.264 8.2.4.1) and the MT8183 firmware
+  resolves reference-list entries by `pic_num`. Confirmed with an
+  `LD_PRELOAD` ioctl shim: GStreamer sends 0xFFFFFFFE/0xFFFFFFFF for the
+  wrapped refs, the bridge sent 14/15. Fix: compute PicNum with the wrap
+  (long-term refs excluded), sort the DPB by signed PicNum, pass the SPS
+  into `h264_fill_decode_params()` for `MaxFrameNum`. Same clip is now
+  **bit-exact on all 150 frames**; BBB unchanged (frame 87 ~4.75 mean is a
+  separate pre-existing difference). Details: `docs/mt8183-notes.md` §14.
+
 ## Open (priority order)
 
 - **CHROMIUM BUG (not ours): `BigBuckBunny.mp4` stops at frame ~89.** Proven

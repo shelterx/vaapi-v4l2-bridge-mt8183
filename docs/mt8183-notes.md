@@ -556,3 +556,108 @@ JPEG/VPP are still found because they don't need the request API.
 with a relaxed sandbox. Options: run with `MOZ_DISABLE_RDD_SANDBOX=1` (a
 security trade-off), allow `/dev/media*` through Firefox's sandbox policy, or
 make the bridge probe not hard-require `/dev/media1` for H.264 detection.
+
+## 13. Software de-tile cost *in situ*, and de-tiling straight into the bo (2026-10-20)
+
+The long-standing "~1.4 ms/frame @1080p (~4% of a core)" figure came from a
+microbenchmark over **cached malloc buffers**. Measured in the real pipeline
+(Chromium on Wayland, 1920x1088 MM21 capture, `clock_gettime` around the call),
+the de-tile costs **15-18 ms/frame ≈ 45-50% of one core at 30 fps**. The gap is
+the memory, not the code: the capture planes are an **uncached CMA mapping**
+(Y and UV, ~3.1 MB total per frame), and reading them at ~200-400 MB/s
+dominates everything the de-tiler does. Any "the de-tiler is cheap" statement
+must be qualified with the buffer type it was measured on.
+
+What that implies (all measured, 1080p):
+
+- **Loop order matters for the source, not the destination.** Writing the
+  destination row-major (`tr, r, tc`, one sequential burst per row) is ~22%
+  **slower** in situ (20.1 vs 16.4 ms) even though it is ~29% faster on cached
+  malloc buffers: the reorder turns a sequential uncached read into a
+  stride-512 read. Do not "optimise" the order based on a cached benchmark.
+- **Compiler flags add nothing.** `-march=native`, `-mcpu=cortex-a76` and
+  `-march=armv8.2-a+dotprod+i8mm+fp16` produce identical code (or
+  reorder-only) for `v4l2sl_mm21_detile`; LTO changes no instruction in the hot
+  path. `-mcpu=cortex-a76` is also unsafe on this big.LITTLE SoC (A55 cores
+  lack dotprod/fp16). Hand-written NEON is equal or slower than the compiler's
+  `ldp`/`stp` pairs.
+- **Clearing the memfd intermediate is a real (if modest) win.** The old path
+  was de-tile → memfd, then `v4l2sl_gbm_surface_sync` memfd → bo (1.5 ms).
+  `v4l2sl_gbm_surface_detile_mm21()` (`src/v4l2stateless_gbm.c`) now de-tiles
+  directly into the mapped bo, with independent Y/UV pointers and strides
+  (bo layout: visible `h` rows, UV at `stride*h`; capture tiles cover the
+  aligned `alh`, whose padding rows must not be written). Interleaved A/B in
+  one process (200 frames per arm, so thermal drift hits both equally):
+
+  | n (frames) | direct to bo | memfd de-tile | memfd → bo sync | saving |
+  |---|---|---|---|---|
+  | 400 | 12.36 ms | 15.90 ms | 1.46 ms | 5.00 ms |
+  | 1200 | 15.43 ms | 17.23 ms | 1.49 ms | 3.29 ms |
+  | 2400 | 16.43 ms | 17.61 ms | 1.52 ms | 2.70 ms |
+
+  ≈ **3.3 ms/frame (~10% of a core at 30 fps)**. Whole-browser 2-minute runs:
+  153.0% → 143.3% total CPU, gpu-process 89.2% → 81.3%. The memfd is kept as a
+  **lazy** readback snapshot: `v4l2sl_surface_ensure_memfd()` refills it from
+  the bo if `vaGetImage`/`vaDeriveImage` asks, so CPU-readback clients still
+  work. If the bo cannot take the capture stride (`aw > bo stride`) the path
+  falls back to the memfd de-tile unchanged.
+- **Remaining cost is the uncached source read.** The direct path does not and
+  cannot remove it; only the MDP3 hardware de-tile would (still blocked on the
+  GCE EOF bug, §`docs/mt8183-mdp3.md`).
+
+## 14. H.264 PicNum wraparound — blocky artifacts with B-pyramid (2026-10-20)
+
+**Symptom:** deterministic blocky/mosaic patches on moving content (faces,
+hands, high-contrast edges), always in the same places, clearing at the next
+IDR. Seen at 720p and 1080p, with both this tree and the older upstream clone.
+Not present with software decode.
+
+**Ruled out first:**
+- The kernel decoder is fine: GStreamer `v4l2slh264dec` (same driver, same
+  MM21 output) is **bit-identical to a software decode** at 480p and 1080p,
+  including a clip that reproduces the artifact through the bridge.
+- The de-tile and the GBM export are fine: `vaExportSurfaceHandle` read back
+  through ffmpeg (`hwdownload`) matches software except on the buggy frames.
+- Not a reference-timestamp problem: no `Reference invalid` in `dmesg`, and
+  all DPB `reference_ts` values resolve to live capture buffers.
+
+**Reproduction:** 6 s 1080p x264 with `bframes=3:b-pyramid=normal` —
+frames 108–124 differ (~2% of pixels, max 179), frames 0–107 and 125+ are
+exact. `bframes=0` is exact; `b-pyramid=none` is nearly exact; the pyramid
+(B frames used as references) is what triggers it, independent of ref count.
+
+**Root cause:** `h264_fill_dpb_entry()` set the DPB entry's `pic_num` to
+VA-API's `frame_idx` (= FrameNum) for every reference. H.264 8.2.4.1 derives
+PicNum with the FrameNum wrap: a reference whose FrameNum is *ahead* of the
+current picture's belongs to the previous wrap and has
+`PicNum = FrameNum - MaxFrameNum` (negative). The MT8183 firmware resolves
+reference-list entries by `slice_h264_dpb_entry.pic_num`, so at a wrap every
+wrapped reference was mapped to the wrong picture and used for motion
+compensation.
+
+**Evidence:** an `ioctl` shim (`LD_PRELOAD`, intercepts
+`VIDIOC_S_EXT_CTRLS`/`V4L2_CID_STATELESS_H264_DECODE_PARAMS`) captured what a
+known-good client sends. For a P picture with `frame_num=2`, GStreamer sent
+`pic_num` **0xFFFFFFFE / 0xFFFFFFFF** for its `frame_num=14/15` references and
+ordered the DPB by PicNum; the bridge sent **14 / 15**, so the kernel/firmware
+resolved them as future frames instead of the previous wrap.
+
+**Fix** (`src/v4l2stateless_h264.c`):
+- `h264_fill_dpb_entry()` now takes the current `frame_num` and
+  `MaxFrameNum` (`1 << (log2_max_frame_num_minus4 + 4)`) and computes
+  `pic_num = FrameNum - MaxFrameNum` when the reference is a short-term
+  picture ahead of the current one. Long-term references are excluded:
+  their LongTermPicNum is the index, not a wrapped FrameNum.
+- The DPB is sorted by (signed) PicNum, matching reference userspace.
+- `h264_fill_decode_params()` takes the SPS to derive `MaxFrameNum`
+  (`tests/test_vp8_mpeg2_fill.c` updated for the new signature).
+
+After the fix the same clip is **bit-exact on all 150 frames** against a
+software decode, and the original `BigBuckBunny.mp4` keeps its previous
+behaviour (frame 87 differs by ~4.75 mean, pre-existing and unrelated — BBB
+uses no MMCO; the Chromium stall at frame ~90 is a Chromium `H264Decoder`
+issue, frame 90 never reaches the bridge).
+
+**Diagnostic tip:** the `LD_PRELOAD` ioctl shim is the cheapest way to compare
+what the bridge sends against a known-good client; intercept
+`VIDIOC_S_EXT_CTRLS` and dump the `v4l2_ctrl_h264_*` payloads.
