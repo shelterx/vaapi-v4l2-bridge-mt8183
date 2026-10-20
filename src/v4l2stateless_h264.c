@@ -100,11 +100,28 @@ static uint64_t h264_find_ref_timestamp(struct v4l2sl_driver_data *dd,
  */
 static void h264_fill_dpb_entry(struct v4l2_h264_dpb_entry *dpb,
                                 const VAPictureH264 *ref,
-                                uint64_t ref_ts)
+                                uint64_t ref_ts,
+                                uint32_t cur_frame_num,
+                                uint32_t max_frame_num)
 {
+    /*
+     * PicNum wraps with FrameNum (H.264 8.2.4.1): a reference whose
+     * frame_num is "ahead" of the current one belongs to the previous wrap
+     * and has a negative PicNum. The firmware resolves reference-list
+     * entries by PicNum, so sending the raw FrameNum here mis-maps every
+     * reference across a frame_num wrap (blocky MC errors until the next
+     * IDR). VA-API only exposes frame_idx == FrameNum, so derive PicNum.
+     */
+    int32_t fn = (int32_t)ref->frame_idx;
+    int32_t pn = fn;
+
+    if (!(ref->flags & VA_PICTURE_H264_LONG_TERM_REFERENCE) &&
+        fn > (int32_t)cur_frame_num)
+        pn = fn - (int32_t)max_frame_num;
+
     dpb->top_field_order_cnt = ref->TopFieldOrderCnt;
     dpb->bottom_field_order_cnt = ref->BottomFieldOrderCnt;
-    dpb->frame_num = ref->frame_idx;
+    dpb->frame_num = (uint32_t)fn;
 
     /* Map flags */
     dpb->flags = 0;
@@ -116,7 +133,7 @@ static void h264_fill_dpb_entry(struct v4l2_h264_dpb_entry *dpb,
         dpb->flags |= V4L2_H264_DPB_ENTRY_FLAG_FIELD;
 
     dpb->reference_ts = ref_ts;
-    dpb->pic_num = ref->frame_idx;
+    dpb->pic_num = (uint32_t)pn;
     dpb->fields = V4L2_H264_FRAME_REF;
 }
 
@@ -206,8 +223,11 @@ void h264_fill_pps(struct v4l2_ctrl_h264_pps *pps,
 void h264_fill_decode_params(struct v4l2_ctrl_h264_decode_params *dec,
                              const VAPictureParameterBufferH264 *pic,
                              struct v4l2sl_driver_data *dd,
+                             const struct v4l2_ctrl_h264_sps *sps,
                              const VASliceParameterBufferH264 *slice)
 {
+    uint32_t max_frame_num = 1u << (sps->log2_max_frame_num_minus4 + 4);
+
     memset(dec, 0, sizeof(*dec));
 
     /* Fill DPB from reference frames, looking up their V4L2 timestamps */
@@ -216,17 +236,19 @@ void h264_fill_decode_params(struct v4l2_ctrl_h264_decode_params *dec,
         if (ref->flags & VA_PICTURE_H264_INVALID)
             continue;
         uint64_t ref_ts = h264_find_ref_timestamp(dd, ref->picture_id);
-        h264_fill_dpb_entry(&dec->dpb[i], ref, ref_ts);
+        h264_fill_dpb_entry(&dec->dpb[i], ref, ref_ts,
+                            pic->frame_num, max_frame_num);
         /* VALID marks the slot as populated — the kernel skips entries
          * without it. ACTIVE marks it usable as a reference. */
         dec->dpb[i].flags |= V4L2_H264_DPB_ENTRY_FLAG_VALID;
     }
 
-    /* Order DPB slots ascending by frame_num, mirroring reference userspace */
+    /* Order DPB slots ascending by PicNum, mirroring reference userspace
+     * (PicNum is signed across a frame_num wrap). */
     for (int i = 1; i < 16; i++) {
         struct v4l2_h264_dpb_entry key = dec->dpb[i];
         int j = i - 1;
-        while (j >= 0 && dec->dpb[j].frame_num > key.frame_num) {
+        while (j >= 0 && (int32_t)dec->dpb[j].pic_num > (int32_t)key.pic_num) {
             dec->dpb[j + 1] = dec->dpb[j];
             j--;
         }
@@ -348,7 +370,8 @@ VAStatus v4l2sl_h264_translate(struct v4l2sl_context *ctx,
 
     h264_fill_sps(&sps, pic_param, ctx->profile);
     h264_fill_pps(&pps, pic_param, slice_param);
-    h264_fill_decode_params(&dec, pic_param, ctx->driver_data, slice_param);
+    h264_fill_decode_params(&dec, pic_param, ctx->driver_data, &sps,
+                            slice_param);
 
     if (iq_matrix)
         h264_fill_scaling_matrix(&sm, iq_matrix);
