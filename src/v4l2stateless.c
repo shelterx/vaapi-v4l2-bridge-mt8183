@@ -604,6 +604,10 @@ v4l2sl_create_surfaces(VADriverContextP ctx,
 {
     struct v4l2sl_driver_data *driver_data = ctx->pDriverData;
 
+    if (v4l2sl_debug)
+        fprintf(stderr, "v4l2stateless: create_surfaces: enter %dx%d fmt=0x%x n=%d\n",
+                width, height, (unsigned)format, num_surfaces);
+
     if (format == VA_RT_FORMAT_YUV420 || format == 0)
         format = VA_FOURCC_NV12;
     else if (format == VA_RT_FORMAT_YUV420_10)
@@ -660,6 +664,8 @@ v4l2sl_create_surfaces(VADriverContextP ctx,
         created++;
     }
 
+    if (v4l2sl_debug)
+        fprintf(stderr, "v4l2stateless: create_surfaces: ret=0 created=%d\n", created);
     pthread_mutex_unlock(&g_v4l2sl_lock);
     return VA_STATUS_SUCCESS;
 
@@ -684,6 +690,9 @@ fail:
             surfaces[j] = VA_INVALID_ID;
         }
     }
+    if (v4l2sl_debug)
+        fprintf(stderr, "v4l2stateless: create_surfaces: ret=-2 (fail, created=%d)\n",
+                created);
     pthread_mutex_unlock(&g_v4l2sl_lock);
     return VA_STATUS_ERROR_ALLOCATION_FAILED;
 }
@@ -717,8 +726,13 @@ v4l2sl_create_surfaces2(VADriverContextP ctx,
         fourcc != VA_FOURCC_YUY2 && fourcc != VA_FOURCC_Y210 &&
         fourcc != VA_FOURCC_I420 &&
         fourcc != VA_FOURCC_ARGB && fourcc != VA_FOURCC_BGRA &&
-        fourcc != VA_FOURCC_BGRX)
+        fourcc != VA_FOURCC_BGRX) {
+        if (v4l2sl_debug)
+            fprintf(stderr,
+                    "v4l2stateless: create_surfaces2: ret=-3 (unsupported fmt=0x%x)\n",
+                    (unsigned)fourcc);
         return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+    }
 
     return v4l2sl_create_surfaces(ctx, width, height, fourcc,
                                   num_surfaces, surfaces);
@@ -940,6 +954,11 @@ v4l2sl_create_context(VADriverContextP ctx,
 {
     struct v4l2sl_driver_data *driver_data = ctx->pDriverData;
 
+    if (v4l2sl_debug)
+        fprintf(stderr, "v4l2stateless: create_context: enter cfg=%u %dx%d rt=%d\n",
+                (unsigned)config_id, picture_width, picture_height,
+                num_render_targets);
+
     struct v4l2sl_context *context = calloc(1, sizeof(*context));
     if (!context)
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
@@ -1094,6 +1113,9 @@ v4l2sl_create_context(VADriverContextP ctx,
     context->next = driver_data->contexts;
     driver_data->contexts = context;
 
+    if (v4l2sl_debug)
+        fprintf(stderr, "v4l2stateless: create_context: ret=0 ctx=%u\n",
+                (unsigned)*context_id);
     pthread_mutex_unlock(&g_v4l2sl_lock);
     return VA_STATUS_SUCCESS;
 
@@ -1102,6 +1124,8 @@ fail:
     free(context->device_path);
     free(context->render_targets);
     free(context);
+    if (v4l2sl_debug)
+        fprintf(stderr, "v4l2stateless: create_context: ret=-5 (fail)\n");
     pthread_mutex_unlock(&g_v4l2sl_lock);
     return VA_STATUS_ERROR_OPERATION_FAILED;
 }
@@ -1146,6 +1170,10 @@ v4l2sl_create_buffer(VADriverContextP ctx,
                      VABufferID *buf_id)
 {
     struct v4l2sl_driver_data *driver_data = ctx->pDriverData;
+
+    if (v4l2sl_debug)
+        fprintf(stderr, "v4l2stateless: create_buffer: enter type=0x%x size=%u\n",
+                (unsigned)type, size);
 
     struct v4l2sl_buffer *buf = calloc(1, sizeof(*buf));
     if (!buf)
@@ -1198,6 +1226,9 @@ v4l2sl_create_buffer(VADriverContextP ctx,
     }
     pthread_mutex_unlock(&g_v4l2sl_lock);
 
+    if (v4l2sl_debug)
+        fprintf(stderr, "v4l2stateless: create_buffer: ret=0 type=0x%x\n",
+                (unsigned)type);
     return VA_STATUS_SUCCESS;
 }
 
@@ -1337,6 +1368,10 @@ v4l2sl_begin_picture(VADriverContextP ctx,
     struct v4l2sl_context *context;
     VAStatus st;
 
+    if (v4l2sl_debug)
+        fprintf(stderr, "v4l2stateless: begin_picture: enter ctx=%u rt=%u\n",
+                (unsigned)context_id, (unsigned)render_target);
+
     pthread_mutex_lock(&g_v4l2sl_lock);
     context = driver_data->contexts;
     while (context && context->context_id != context_id)
@@ -1388,6 +1423,8 @@ v4l2sl_begin_picture(VADriverContextP ctx,
     st = VA_STATUS_SUCCESS;
 
 out:
+    if (v4l2sl_debug)
+        fprintf(stderr, "v4l2stateless: begin_picture: ret=%d\n", (int)st);
     pthread_mutex_unlock(&g_v4l2sl_lock);
     return st;
 }
@@ -1402,12 +1439,18 @@ v4l2sl_render_picture(VADriverContextP ctx,
     struct v4l2sl_context *context;
     VAStatus st;
 
+    if (v4l2sl_debug)
+        fprintf(stderr, "v4l2stateless: render_picture: enter ctx=%u nbuf=%d\n",
+                (unsigned)context_id, num_buffers);
+
     pthread_mutex_lock(&g_v4l2sl_lock);
     context = driver_data->contexts;
     while (context && context->context_id != context_id)
         context = context->next;
 
     if (!context) {
+        if (v4l2sl_debug)
+            fprintf(stderr, "v4l2stateless: render_picture: ret=-6 (no ctx)\n");
         pthread_mutex_unlock(&g_v4l2sl_lock);
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
@@ -1442,6 +1485,9 @@ v4l2sl_render_picture(VADriverContextP ctx,
     }
 
     st = VA_STATUS_SUCCESS;
+    if (v4l2sl_debug)
+        fprintf(stderr, "v4l2stateless: render_picture: ret=0 nbuf=%d\n",
+                num_buffers);
     pthread_mutex_unlock(&g_v4l2sl_lock);
     return st;
 }
@@ -1459,17 +1505,25 @@ v4l2sl_end_picture(VADriverContextP ctx,
     struct v4l2sl_context *context;
     VAStatus va_status;
 
+    if (v4l2sl_debug)
+        fprintf(stderr, "v4l2stateless: end_picture: enter ctx=%u\n",
+                (unsigned)context_id);
+
     pthread_mutex_lock(&g_v4l2sl_lock);
     context = driver_data->contexts;
     while (context && context->context_id != context_id)
         context = context->next;
 
     if (!context) {
+        if (v4l2sl_debug)
+            fprintf(stderr, "v4l2stateless: end_picture: ret=-6 (no ctx)\n");
         pthread_mutex_unlock(&g_v4l2sl_lock);
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
 
     if (!context->current_surface) {
+        if (v4l2sl_debug)
+            fprintf(stderr, "v4l2stateless: end_picture: ret=-7 (no surface)\n");
         pthread_mutex_unlock(&g_v4l2sl_lock);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
@@ -1561,6 +1615,8 @@ v4l2sl_end_picture(VADriverContextP ctx,
 
     pthread_mutex_unlock(&g_v4l2sl_lock);
     /* request_fd lifecycle is owned by decode_submit / begin_picture */
+    if (v4l2sl_debug)
+        fprintf(stderr, "v4l2stateless: end_picture: ret=0 (translate ok)\n");
     return VA_STATUS_SUCCESS;
 }
 
