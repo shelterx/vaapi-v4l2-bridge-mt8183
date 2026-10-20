@@ -211,6 +211,73 @@ int v4l2sl_gbm_surface_sync(struct v4l2sl_surface *s)
     return -1;
 }
 
+/* De-tile MM21 straight into the mapped bo. The bo has the R8 layout
+ * (visible h rows, UV at stride*h), while the capture is tiled on the
+ * aligned geometry, so Y and UV need independent pointers/strides and the
+ * padding rows past h must not be written. */
+static void detile_planes_to(const uint8_t *ysrc, const uint8_t *usrc,
+                             uint8_t *ydst, uint32_t ystride,
+                             uint8_t *udst, uint32_t ustride,
+                             uint32_t aw, uint32_t ah, uint32_t vis_h)
+{
+    uint32_t y_tc = aw / 16, y_tr = ah / 32;
+    uint32_t uvis = (vis_h + 1) / 2;
+
+    for (uint32_t tr = 0; tr < y_tr; tr++)
+        for (uint32_t tc = 0; tc < y_tc; tc++) {
+            const uint8_t *ts = ysrc + (size_t)(tr * y_tc + tc) * 512;
+
+            for (uint32_t r = 0; r < 32; r++) {
+                uint32_t y = tr * 32 + r;
+
+                if (y >= vis_h)
+                    break;
+                for (uint32_t c = 0; c < 16; c++)
+                    ydst[(size_t)y * ystride + (size_t)tc * 16 + c] =
+                        ts[r * 16 + c];
+            }
+        }
+    for (uint32_t tr = 0; tr < y_tr; tr++)
+        for (uint32_t tc = 0; tc < y_tc; tc++) {
+            const uint8_t *ts = usrc + (size_t)(tr * y_tc + tc) * 256;
+
+            for (uint32_t r = 0; r < 16; r++) {
+                uint32_t y = tr * 16 + r;
+
+                if (y >= uvis)
+                    break;
+                for (uint32_t c = 0; c < 16; c++)
+                    udst[(size_t)y * ustride + (size_t)tc * 16 + c] =
+                        ts[r * 16 + c];
+            }
+        }
+}
+
+int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
+                                   const uint8_t *ysrc, const uint8_t *usrc,
+                                   uint32_t aw, uint32_t ah)
+{
+    uint32_t w = s->width, h = s->height;
+    void *map_data = NULL;
+    uint32_t mstride = 0;
+    uint8_t *dst;
+
+    if (!s || !s->gbm_bo || !ysrc || !usrc)
+        return -1;
+    dst = gbm_bo_map(s->gbm_bo, 0, 0, w, h + (h + 1) / 2,
+                     GBM_BO_TRANSFER_WRITE, &mstride, &map_data);
+    if (!dst)
+        return -1;
+    if (aw > mstride) {   /* capture stride wider than the bo: fall back */
+        gbm_bo_unmap(s->gbm_bo, map_data);
+        return -1;
+    }
+    detile_planes_to(ysrc, usrc, dst, mstride,
+                     dst + (size_t)mstride * h, mstride, aw, ah, h);
+    gbm_bo_unmap(s->gbm_bo, map_data);
+    return 0;
+}
+
 void v4l2sl_gbm_surface_destroy(struct v4l2sl_surface *s)
 {
     if (s && s->gbm_bo) {

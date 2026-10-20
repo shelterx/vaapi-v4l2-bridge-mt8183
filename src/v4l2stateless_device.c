@@ -1218,8 +1218,33 @@ int v4l2sl_surface_pull_capture(struct v4l2sl_context *ctx,
         if (!ctx->capture_uv_ptr[buf_index])
             return -1; /* MM21 needs both Y and UV planes mapped */
         v4l2sl_explog("v4l2stateless: pull_capture MM21 idx=%d\n", buf_index);
+        surf->has_pic = 1;
+        surf->buf_index = buf_index;
+        surf->stride = stride;
+        surf->aligned_h = alh;
+        surf->cap_fourcc = V4L2_PIX_FMT_NV12;   /* de-tiled to linear NV12 */
+        surf->de_tiled = 1;
+
+        /*
+         * De-tile straight into the exported bo when there is one: the bo is
+         * what Chromium samples, so writing the memfd and then copying it
+         * into the bo costs an extra full-frame pass. The memfd stays a lazy
+         * CPU-readback snapshot, refilled from the bo on demand by
+         * v4l2sl_surface_ensure_memfd() (vaGetImage / vaDeriveImage).
+         * Measured at 1080p: 13.6-16.4 ms/frame direct vs 16.4-18.0 ms for
+         * de-tile -> memfd plus 1.5 ms memfd -> bo.
+         */
+        if (surf->gbm_bo &&
+            v4l2sl_gbm_surface_detile_mm21(surf, src,
+                                           ctx->capture_uv_ptr[buf_index],
+                                           stride, alh) == 0) {
+            surf->last_writer = V4L2SL_WRITER_BO;
+            return 0;
+        }
+
         {
             uint32_t out_sz = stride * alh * 3 / 2;
+
             if (v4l2sl_surface_grow_memfd(surf, out_sz) < 0)
                 return -1;
             dst = v4l2sl_surface_map_memfd(surf, out_sz);
@@ -1228,20 +1253,9 @@ int v4l2sl_surface_pull_capture(struct v4l2sl_context *ctx,
         }
         v4l2sl_mm21_detile(src, ctx->capture_uv_ptr[buf_index],
                            (uint8_t *)dst, stride, alh);
-
-        surf->has_pic = 1;
-        surf->buf_index = buf_index;
-        surf->stride = stride;
-        surf->aligned_h = alh;
-        surf->cap_fourcc = V4L2_PIX_FMT_NV12;   /* de-tiled to linear NV12 */
         surf->last_writer = V4L2SL_WRITER_MEMFD;
-        surf->de_tiled = 1;
-        /*
-         * Chromium exports the surface pool before the first picture and
-         * caches the imported dma-buf, so for tiled capture we hand it a GBM
-         * bo at export time. Push the freshly de-tiled frame into that bo now
-         * (a no-op if no bo was created).
-         */
+        /* No bo yet (or direct write refused): push the de-tiled frame into
+         * the bo if one exists, else the memfd is the only copy. */
         if (surf->gbm_bo)
             (void)v4l2sl_gbm_surface_sync(surf);
         return 0;
