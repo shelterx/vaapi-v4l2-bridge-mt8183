@@ -130,6 +130,11 @@ static int mock_ioctl(int fd, unsigned long request, void *arg)
         }
         return 0;
     }
+    if (request == VIDIOC_ENUM_FMT) {
+        /* Like the kernel: stop enumeration when there is nothing to list. */
+        errno = EINVAL;
+        return -1;
+    }
     if (request == VIDIOC_S_FMT) {
         struct v4l2_format *fmt = arg;
 
