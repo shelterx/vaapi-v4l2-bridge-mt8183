@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <poll.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <linux/media.h>
@@ -30,6 +31,11 @@
 #include "v4l2stateless_probe.h"
 
 static v4l2sl_ioctl_fn g_ioctl_hook;
+
+/* filled by decode_submit, consumed by the matching pull_capture */
+static double g_prof_pending_decode = -1;
+static double g_prof_pending_detile = -1;
+static int64_t g_prof_pending_frame_us;
 
 void v4l2sl_set_ioctl_hook(v4l2sl_ioctl_fn fn)
 {
@@ -446,7 +452,130 @@ void v4l2sl_decode_reset(struct v4l2sl_context *ctx)
     rebuild_free_pools(ctx);
 }
 
+
+/*
+ * Opt-in per-frame timing (V4L2SL_PROFILE=<window>, default 120 frames).
+ * Decode and pull_capture run back-to-back on the decoder thread, so the
+ * interval between frames shows whether a stutter comes from us or from
+ * upstream pacing. Everything is a no-op unless the env var is set.
+ */
+static struct {
+    int enabled, window, n, slow;
+    double dec_sum, dec_max;
+    double pull_sum, pull_max;
+    double det_sum, det_max;
+    double iv_sum, iv_max;
+    int64_t last_frame_us;
+} g_prof;
+
+static int64_t prof_now_us(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static void prof_init(void)
+{
+    const char *e = getenv("V4L2SL_PROFILE");
+
+    if (!e || !e[0] || e[0] == '0')
+        return;
+    g_prof.window = atoi(e);
+    if (g_prof.window <= 0)
+        g_prof.window = 120;
+    g_prof.enabled = 1;
+    fprintf(stderr, "v4l2stateless: profile on, window=%d frames\n",
+            g_prof.window);
+}
+
+static void prof_report(void)
+{
+    if (g_prof.n < g_prof.window)
+        return;
+    fprintf(stderr,
+            "v4l2stateless: profile n=%d decode avg=%.1f max=%.1f | "
+            "detile avg=%.1f max=%.1f | pull avg=%.1f max=%.1f | "
+            "interval avg=%.1f max=%.1f | gaps>60ms=%d\n",
+            g_prof.n, g_prof.dec_sum / g_prof.n, g_prof.dec_max,
+            g_prof.det_sum / g_prof.n, g_prof.det_max,
+            g_prof.pull_sum / g_prof.n, g_prof.pull_max,
+            g_prof.iv_sum / g_prof.n, g_prof.iv_max, g_prof.slow);
+    g_prof.n = 0;
+    g_prof.dec_sum = g_prof.dec_max = 0;
+    g_prof.pull_sum = g_prof.pull_max = 0;
+    g_prof.det_sum = g_prof.det_max = 0;
+    g_prof.iv_sum = g_prof.iv_max = 0;
+    g_prof.slow = 0;
+}
+
+static void prof_frame(int64_t t0_us, int64_t t1_us, double decode_ms,
+                       double detile_ms, double pull_ms)
+{
+    double iv;
+
+    if (!g_prof.enabled)
+        return;
+    if (g_prof.last_frame_us) {
+        iv = (t0_us - g_prof.last_frame_us) / 1000.0;
+        g_prof.iv_sum += iv;
+        if (iv > g_prof.iv_max)
+            g_prof.iv_max = iv;
+        if (iv > 60.0)
+            g_prof.slow++;
+    }
+    g_prof.last_frame_us = t0_us;
+    if (decode_ms >= 0) {
+        g_prof.dec_sum += decode_ms;
+        if (decode_ms > g_prof.dec_max)
+            g_prof.dec_max = decode_ms;
+    }
+    if (detile_ms >= 0) {
+        g_prof.det_sum += detile_ms;
+        if (detile_ms > g_prof.det_max)
+            g_prof.det_max = detile_ms;
+    }
+    if (pull_ms >= 0) {
+        g_prof.pull_sum += pull_ms;
+        if (pull_ms > g_prof.pull_max)
+            g_prof.pull_max = pull_ms;
+    }
+    if (decode_ms > 25.0 || pull_ms > 8.0)
+        fprintf(stderr,
+                "v4l2stateless: profile slow frame decode=%.1f detile=%.1f "
+                "pull=%.1f\n",
+                decode_ms, detile_ms, pull_ms);
+    g_prof.n++;
+    prof_report();
+    (void)t1_us;
+}
+
+static int decode_submit_inner(struct v4l2sl_context *ctx, int out_buf_idx,
+                               uint32_t bytesused, uint64_t timestamp);
+
 int v4l2sl_decode_submit(struct v4l2sl_context *ctx, int out_buf_idx,
+                         uint32_t bytesused, uint64_t timestamp)
+{
+    static int prof_ready;
+    int64_t t0, t1;
+    int ret;
+
+    if (!prof_ready) {
+        prof_ready = 1;
+        prof_init();
+    }
+    if (!g_prof.enabled)
+        return decode_submit_inner(ctx, out_buf_idx, bytesused, timestamp);
+    t0 = prof_now_us();
+    ret = decode_submit_inner(ctx, out_buf_idx, bytesused, timestamp);
+    t1 = prof_now_us();
+    g_prof_pending_decode = (t1 - t0) / 1000.0;
+    g_prof_pending_frame_us = t0;
+    return ret;
+}
+
+static int decode_submit_inner(struct v4l2sl_context *ctx, int out_buf_idx,
                          uint32_t bytesused, uint64_t timestamp)
 {
     struct pollfd pfd;
@@ -1190,8 +1319,30 @@ void *v4l2sl_surface_map_memfd(struct v4l2sl_surface *s, uint32_t need)
     return s->memfd_map;
 }
 
+static int pull_capture_inner(struct v4l2sl_context *ctx,
+                             struct v4l2sl_surface *surf, int buf_index);
+
 int v4l2sl_surface_pull_capture(struct v4l2sl_context *ctx,
                                 struct v4l2sl_surface *surf, int buf_index)
+{
+    int64_t t0, t1;
+    int ret;
+
+    if (!g_prof.enabled)
+        return pull_capture_inner(ctx, surf, buf_index);
+    t0 = prof_now_us();
+    ret = pull_capture_inner(ctx, surf, buf_index);
+    t1 = prof_now_us();
+    prof_frame(g_prof_pending_frame_us ? g_prof_pending_frame_us : t0, t1,
+               g_prof_pending_decode, g_prof_pending_detile,
+               (t1 - t0) / 1000.0);
+    g_prof_pending_decode = -1;
+    g_prof_pending_detile = -1;
+    return ret;
+}
+
+static int pull_capture_inner(struct v4l2sl_context *ctx,
+                             struct v4l2sl_surface *surf, int buf_index)
 {
     uint32_t sz, stride, alh, fcc;
     void *src, *dst;
@@ -1235,6 +1386,12 @@ int v4l2sl_surface_pull_capture(struct v4l2sl_context *ctx,
         surf->aligned_h = alh;
         surf->cap_fourcc = V4L2_PIX_FMT_NV12;   /* de-tiled to linear NV12 */
         surf->de_tiled = 1;
+        int64_t t_det0 = g_prof.enabled ? prof_now_us() : 0;
+#define PROF_DETILE_END()                                                    \
+        do {                                                                 \
+            if (t_det0)                                                      \
+                g_prof_pending_detile = (prof_now_us() - t_det0) / 1000.0;    \
+        } while (0)
 
         /*
          * HW de-tile (MDP3 m2m VPU): export the decoder's MM21 capture planes
@@ -1261,6 +1418,7 @@ int v4l2sl_surface_pull_capture(struct v4l2sl_context *ctx,
                 if (bo)
                     v4l2sl_gbm_surface_unmap(surf, bo, bo_data);
                 if (ok) {
+                    PROF_DETILE_END();
                     surf->last_writer = V4L2SL_WRITER_BO;
                     return 0;
                 }
@@ -1280,6 +1438,7 @@ int v4l2sl_surface_pull_capture(struct v4l2sl_context *ctx,
             v4l2sl_gbm_surface_detile_mm21(surf, src,
                                            ctx->capture_uv_ptr[buf_index],
                                            stride, alh) == 0) {
+            PROF_DETILE_END();
             surf->last_writer = V4L2SL_WRITER_BO;
             return 0;
         }
@@ -1295,6 +1454,7 @@ int v4l2sl_surface_pull_capture(struct v4l2sl_context *ctx,
         }
         v4l2sl_mm21_detile(src, ctx->capture_uv_ptr[buf_index],
                            (uint8_t *)dst, stride, alh);
+        PROF_DETILE_END();
         surf->last_writer = V4L2SL_WRITER_MEMFD;
         /* No bo yet (or direct write refused): push the de-tiled frame into
          * the bo if one exists, else the memfd is the only copy. */
