@@ -452,6 +452,14 @@ int v4l2sl_gbm_surface_sync(struct v4l2sl_surface *s);
 int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
                                    const uint8_t *ysrc, const uint8_t *usrc,
                                    uint32_t aw, uint32_t ah);
+/* Async variant (V4L2SL_DETILE_ASYNC=1): starts the de-tile on a worker
+ * thread and returns. v4l2sl_gbm_detile_wait() joins the pending job; call it
+ * before freeing/reusing the capture slot or the bo. */
+int v4l2sl_gbm_surface_detile_async(struct v4l2sl_surface *s,
+                                    const uint8_t *ysrc, const uint8_t *usrc,
+                                    uint32_t aw, uint32_t ah);
+int v4l2sl_gbm_detile_async_wanted(void);
+void v4l2sl_gbm_detile_wait(void);
 /* Map the bo for writing (HW de-tile writes NV12 into it); unmap when done.
  * Returns the mapped Y pointer (NULL on failure); *out_stride / *out_data
  * receive the bo stride and the unmap handle. */

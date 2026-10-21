@@ -330,6 +330,8 @@ void v4l2sl_release_context_device(struct v4l2sl_context *ctx)
     if (!ctx)
         return;
 
+    v4l2sl_gbm_detile_wait();
+
     /* Persistent M2M queues hold V4L2 MMAP mappings — release them while
      * the device fd is still open. */
     v4l2sl_m2m_teardown(ctx, &ctx->vpp_q);
@@ -428,6 +430,7 @@ static void rebuild_free_pools(struct v4l2sl_context *ctx)
 
 void v4l2sl_decode_reset(struct v4l2sl_context *ctx)
 {
+    v4l2sl_gbm_detile_wait();   /* capture slots are about to be recycled */
     if (!ctx || ctx->v4l2_fd < 0)
         return;
 
@@ -822,6 +825,7 @@ int v4l2sl_ensure_capture(struct v4l2sl_context *ctx, int width, int height,
         v4l2sl_av1_dpb_model_reset(ctx);
     }
 
+    v4l2sl_gbm_detile_wait();   /* pending de-tile reads a capture slot */
     release_ctx_capture_surfaces(ctx);
     v4l2sl_unmap_capture_buffers(ctx);
 
@@ -1423,6 +1427,14 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
                     return 0;
                 }
             }
+        }
+
+        if (surf->gbm_bo && v4l2sl_gbm_detile_async_wanted() &&
+            v4l2sl_gbm_surface_detile_async(surf, src,
+                                            ctx->capture_uv_ptr[buf_index],
+                                            stride, alh) == 0) {
+            surf->last_writer = V4L2SL_WRITER_BO;
+            return 0;
         }
 
         /*

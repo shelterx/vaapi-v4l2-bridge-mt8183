@@ -36,6 +36,9 @@
 #include <drm_fourcc.h>
 #include <va/va.h>
 #include <va/va_drmcommon.h>
+#include <pthread.h>
+#include <time.h>
+
 #include "v4l2stateless.h"
 
 static struct gbm_device *g_gbm_dev;
@@ -118,6 +121,7 @@ int v4l2sl_surface_ensure_memfd(struct v4l2sl_surface *s)
 
     if (!s || !v4l2sl_memfd_stale(s) || !s->gbm_bo)
         return 0;
+    v4l2sl_gbm_detile_wait();   /* bo may still be written by a pending job */
     if (s->memfd_fd < 0 || !s->stride || !s->aligned_h)
         return -1;
     w = s->width;
@@ -280,6 +284,102 @@ void v4l2sl_gbm_surface_unmap(struct v4l2sl_surface *s, void *ptr, void *data)
         gbm_bo_unmap(s->gbm_bo, data);
 }
 
+/*
+ * Asynchronous de-tile (V4L2SL_DETILE_ASYNC=1): the MM21 -> NV12 pass runs on
+ * a worker thread so it overlaps the *next* decode instead of extending the
+ * current frame's critical path. Only one job is in flight (the decoder is
+ * serialized); the next pull waits for it, by which time it has had a whole
+ * decode (~9 ms) to finish.
+ *
+ * The job reads the surface's capture slot and writes its GBM bo, so every
+ * path that can free/reuse either must call v4l2sl_gbm_detile_wait() first:
+ * context release, capture renegotiation, decode reset, surface destroy,
+ * memfd refill, export, and vaSyncSurface.
+ */
+struct async_detile {
+    pthread_t th;
+    int active;
+    int ok;
+    int failed_once;
+    struct v4l2sl_surface *surf;
+    const uint8_t *ysrc;
+    const uint8_t *usrc;
+    uint32_t aw;
+    uint32_t ah;
+};
+
+static struct async_detile g_adetile;
+static pthread_mutex_t g_adetile_lock = PTHREAD_MUTEX_INITIALIZER;
+
+int v4l2sl_gbm_detile_async_wanted(void)
+{
+    const char *e = getenv("V4L2SL_DETILE_ASYNC");
+
+    return e && e[0] && e[0] != '0';
+}
+
+static void *async_detile_main(void *arg)
+{
+    struct async_detile *a = arg;
+    struct timespec t0, t1;
+    double ms;
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    a->ok = v4l2sl_gbm_surface_detile_mm21(a->surf, a->ysrc, a->usrc,
+                                           a->aw, a->ah) == 0;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    if (ms > 8.0)
+        fprintf(stderr, "v4l2stateless: async de-tile slow: %.1f ms\n", ms);
+    return NULL;
+}
+
+void v4l2sl_gbm_detile_wait(void)
+{
+    pthread_mutex_lock(&g_adetile_lock);
+    if (g_adetile.active) {
+        pthread_join(g_adetile.th, NULL);
+        g_adetile.active = 0;
+        if (!g_adetile.ok) {
+            g_adetile.failed_once = 1;
+            fprintf(stderr,
+                    "v4l2stateless: async de-tile job failed; using the "
+                    "synchronous path from now on\n");
+        }
+    }
+    pthread_mutex_unlock(&g_adetile_lock);
+}
+
+int v4l2sl_gbm_surface_detile_async(struct v4l2sl_surface *s,
+                                    const uint8_t *ysrc, const uint8_t *usrc,
+                                    uint32_t aw, uint32_t ah)
+{
+    int rc;
+
+    if (!s || !s->gbm_bo || !ysrc || !usrc)
+        return -1;
+    /* Finish the previous job first: the caller's frame N-1 was displayed
+     * with that bo, and its capture slot may be reused. */
+    v4l2sl_gbm_detile_wait();
+
+    pthread_mutex_lock(&g_adetile_lock);
+    if (g_adetile.failed_once) {
+        pthread_mutex_unlock(&g_adetile_lock);
+        return -1;
+    }
+    g_adetile.surf = s;
+    g_adetile.ysrc = ysrc;
+    g_adetile.usrc = usrc;
+    g_adetile.aw = aw;
+    g_adetile.ah = ah;
+    g_adetile.ok = 0;
+    rc = pthread_create(&g_adetile.th, NULL, async_detile_main, &g_adetile);
+    if (rc == 0)
+        g_adetile.active = 1;
+    pthread_mutex_unlock(&g_adetile_lock);
+    return rc == 0 ? 0 : -1;
+}
+
 int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
                                    const uint8_t *ysrc, const uint8_t *usrc,
                                    uint32_t aw, uint32_t ah)
@@ -307,6 +407,7 @@ int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
 
 void v4l2sl_gbm_surface_destroy(struct v4l2sl_surface *s)
 {
+    v4l2sl_gbm_detile_wait();
     if (s && s->gbm_bo) {
         gbm_bo_destroy(s->gbm_bo);
         s->gbm_bo = NULL;
@@ -322,6 +423,7 @@ VAStatus v4l2sl_surface_fill_prime_gbm(const struct v4l2sl_surface *surf,
 
     if (!surf || !surf->gbm_bo || !descriptor)
         return VA_STATUS_ERROR_INVALID_SURFACE;
+    v4l2sl_gbm_detile_wait();   /* hand out the bo only when fully written */
     fd = gbm_bo_get_fd_for_plane(surf->gbm_bo, 0);
     if (fd < 0)
         return VA_STATUS_ERROR_OPERATION_FAILED;

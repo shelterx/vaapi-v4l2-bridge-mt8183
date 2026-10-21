@@ -1629,6 +1629,7 @@ v4l2sl_sync_surface(VADriverContextP ctx, VASurfaceID render_target)
     struct v4l2sl_driver_data *driver_data = ctx->pDriverData;
     struct v4l2sl_surface *surface;
 
+    v4l2sl_gbm_detile_wait();
     pthread_mutex_lock(&g_v4l2sl_lock);
     surface = v4l2sl_surface_by_id(driver_data, render_target);
     if (!surface) {
