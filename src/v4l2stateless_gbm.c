@@ -315,30 +315,52 @@ int v4l2sl_gbm_detile_async_wanted(void)
 {
     const char *e = getenv("V4L2SL_DETILE_ASYNC");
 
-    return e && e[0] && e[0] != '0';
+    return e && e[0] && e[0] != '0' && strcmp(e, "off") && strcmp(e, "no");
+}
+
+static double ts_ms(const struct timespec *a, const struct timespec *b)
+{
+    return (b->tv_sec - a->tv_sec) * 1e3 + (b->tv_nsec - a->tv_nsec) / 1e6;
 }
 
 static void *async_detile_main(void *arg)
 {
     struct async_detile *a = arg;
-    struct timespec t0, t1;
-    double ms;
+    struct timespec w0, w1, c0, c1;
+    double wall, cpu;
 
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    clock_gettime(CLOCK_MONOTONIC, &w0);
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c0);
     a->ok = v4l2sl_gbm_surface_detile_mm21(a->surf, a->ysrc, a->usrc,
                                            a->aw, a->ah) == 0;
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
-    if (ms > 8.0)
-        fprintf(stderr, "v4l2stateless: async de-tile slow: %.1f ms\n", ms);
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c1);
+    clock_gettime(CLOCK_MONOTONIC, &w1);
+    wall = ts_ms(&w0, &w1);
+    cpu = ts_ms(&c0, &c1);
+    if (wall > 8.0 && getenv("V4L2SL_PROFILE"))
+        fprintf(stderr,
+                "v4l2stateless: async de-tile slow: wall=%.1f cpu=%.1f ms\n",
+                wall, cpu);
     return NULL;
 }
 
 void v4l2sl_gbm_detile_wait(void)
 {
+    struct timespec w0, w1;
+    double waited;
+
     pthread_mutex_lock(&g_adetile_lock);
     if (g_adetile.active) {
+        clock_gettime(CLOCK_MONOTONIC, &w0);
         pthread_join(g_adetile.th, NULL);
+        clock_gettime(CLOCK_MONOTONIC, &w1);
+        waited = ts_ms(&w0, &w1);
+        if (waited > 0.5 && getenv("V4L2SL_PROFILE")) {
+            static int n;
+            if (n++ < 20)
+                fprintf(stderr,
+                        "v4l2stateless: async wait blocked %.1f ms\n", waited);
+        }
         g_adetile.active = 0;
         if (!g_adetile.ok) {
             g_adetile.failed_once = 1;
