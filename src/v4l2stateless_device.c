@@ -318,6 +318,7 @@ void v4l2sl_release_context_device(struct v4l2sl_context *ctx)
      * the device fd is still open. */
     v4l2sl_m2m_teardown(ctx, &ctx->vpp_q);
     v4l2sl_m2m_teardown(ctx, &ctx->jpeg_q);
+    v4l2sl_mdp3_fini(ctx);
 
     if (ctx->v4l2_fd >= 0 && ctx->streamed) {
         v4l2sl_streamoff(ctx->v4l2_fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
@@ -1224,6 +1225,37 @@ int v4l2sl_surface_pull_capture(struct v4l2sl_context *ctx,
         surf->aligned_h = alh;
         surf->cap_fourcc = V4L2_PIX_FMT_NV12;   /* de-tiled to linear NV12 */
         surf->de_tiled = 1;
+
+        /*
+         * HW de-tile (MDP3 m2m VPU): export the decoder's MM21 capture planes
+         * as dma-bufs and import them into the m2m OUTPUT queue, so the CPU
+         * never touches the tiled CMA. The m2m's linear NV12 lands in the
+         * surface bo. Lazy-init on the first MM21 frame; any init failure or
+         * 3 consecutive frame failures disable it for the session and the
+         * software de-tile below takes over.
+         */
+        if (surf->gbm_bo && !ctx->mdp3.disabled) {
+            if (!ctx->mdp3.active) {
+                ctx->mdp3.active = 1; /* init attempted */
+                if (v4l2sl_mdp3_init(ctx, (int)stride, (int)alh) < 0)
+                    ctx->mdp3.disabled = 1;
+            }
+            if (!ctx->mdp3.disabled) {
+                uint32_t bo_stride = 0;
+                void *bo_data = NULL;
+                void *bo = v4l2sl_gbm_surface_map(surf, (uint32_t)surf->width,
+                                                  (uint32_t)surf->height,
+                                                  &bo_stride, &bo_data);
+                int ok = bo &&
+                    v4l2sl_mdp3_detile(ctx, buf_index, bo, bo_stride) == 0;
+                if (bo)
+                    v4l2sl_gbm_surface_unmap(surf, bo, bo_data);
+                if (ok) {
+                    surf->last_writer = V4L2SL_WRITER_BO;
+                    return 0;
+                }
+            }
+        }
 
         /*
          * De-tile straight into the exported bo when there is one: the bo is
