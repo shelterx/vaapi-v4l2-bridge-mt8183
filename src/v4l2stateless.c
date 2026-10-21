@@ -1744,10 +1744,28 @@ v4l2sl_derive_image(VADriverContextP ctx,
     }
 
     if (!surf->has_pic && !surf->cpu_ptr) {
-        fprintf(stderr, "v4l2stateless: derive_image: surface %d has no decoded frame\n",
-                surface);
-        pthread_mutex_unlock(&g_v4l2sl_lock);
-        return VA_STATUS_ERROR_INVALID_SURFACE;
+        /*
+         * VA allows deriving any valid surface; contents are undefined until
+         * a picture is decoded. Firefox probes derive before the first decode
+         * and treats an error as fatal (decoder dies a few seconds in), so
+         * hand back a zeroed image of the surface geometry.
+         */
+        struct v4l2sl_context *c0 = context_for_surface(driver_data, surface);
+        uint32_t st0 = (c0 && c0->cap_stride) ? c0->cap_stride : surf->width;
+        uint32_t ah0 = (c0 && c0->cap_height) ? c0->cap_height : surf->height;
+
+        if (!st0 || !ah0 ||
+            v4l2sl_surface_grow_memfd(
+                surf, v4l2sl_capture_plane_size(V4L2_PIX_FMT_NV12, st0, ah0)) < 0) {
+            pthread_mutex_unlock(&g_v4l2sl_lock);
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
+        if (!surf->stride)
+            surf->stride = st0;
+        if (!surf->aligned_h)
+            surf->aligned_h = ah0;
+        if (!surf->cap_fourcc)
+            surf->cap_fourcc = V4L2_PIX_FMT_NV12;
     }
 
     /* Owning context gives the negotiated capture geometry — the stride
