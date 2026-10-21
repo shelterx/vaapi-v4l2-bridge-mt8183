@@ -228,18 +228,28 @@ int v4l2sl_setup_capture_queue_count(int fd, int width, int height,
         return -1;
     }
 
-    /* Request capture buffers */
+    /* Request capture buffers. Ask for non-coherent (cacheable) memory:
+     * the decoder's DMA is synced by vb2 around QBUF/DQBUF, and a cacheable
+     * mapping turns the CPU de-tile from ~12 ms/frame into ~1.8 ms at 1080p
+     * (a coherent CMA mapping is uncached and reads at ~380 MB/s). Fall back
+     * to coherent buffers if the driver does not accept cache hints. */
     struct v4l2_requestbuffers req = { 0 };
     req.count = count > 0 ? count : V4L2SL_NUM_CAPTURE_BUFS;
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     req.memory = V4L2_MEMORY_MMAP;
+    req.flags = V4L2_MEMORY_FLAG_NON_COHERENT;
 
     if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
-        fprintf(stderr, "v4l2stateless: REQBUFS capture failed: %s\n", strerror(errno));
-        return -1;
+        req.flags = 0;
+        if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
+            fprintf(stderr, "v4l2stateless: REQBUFS capture failed: %s\n",
+                    strerror(errno));
+            return -1;
+        }
     }
 
-    fprintf(stderr, "v4l2stateless: capture queue: %d buffers\n", req.count);
+    fprintf(stderr, "v4l2stateless: capture queue: %d buffers%s\n", req.count,
+            (req.flags & V4L2_MEMORY_FLAG_NON_COHERENT) ? " (cacheable)" : "");
     return req.count;  /* return number of allocated buffers */
 }
 
