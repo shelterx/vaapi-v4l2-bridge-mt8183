@@ -63,6 +63,16 @@ static int mdp3_forced_off(void)
     return e && e[0] && (e[0] == 's' || e[0] == 'S');
 }
 
+/* MDP3 is opt-in: with cacheable (non-coherent) capture buffers the software
+ * de-tile is ~1.8 ms/frame at 1080p, while the m2m job is ~10 ms plus a
+ * readback copy from uncached CMA — the HW path is ~10x slower per frame. */
+static int mdp3_forced_on(void)
+{
+    const char *e = getenv("V4L2SL_DETILE");
+
+    return e && (e[0] == 'h' || e[0] == 'H');
+}
+
 static int mdp3_stream(int fd, uint32_t type, int on)
 {
     uint32_t t = type;   /* STREAMON/OFF take a pointer to a __u32 */
@@ -189,6 +199,13 @@ int v4l2sl_mdp3_init(struct v4l2sl_context *ctx, int width, int height)
         ctx->mdp3.disabled = 1;
         fprintf(stderr,
                 "v4l2stateless: de-tile path = SW (V4L2SL_DETILE=sw)\n");
+        return -1;
+    }
+    if (!mdp3_forced_on()) {
+        ctx->mdp3.disabled = 1;
+        fprintf(stderr,
+                "v4l2stateless: de-tile path = SW (cacheable capture; set "
+                "V4L2SL_DETILE=hw to use MDP3)\n");
         return -1;
     }
 
