@@ -557,6 +557,15 @@ with a relaxed sandbox. Options: run with `MOZ_DISABLE_RDD_SANDBOX=1` (a
 security trade-off), allow `/dev/media*` through Firefox's sandbox policy, or
 make the bridge probe not hard-require `/dev/media1` for H.264 detection.
 
+**Follow-up (2026-10-21): Firefox died ~5 s into every video.** The decoder
+turned out to call `vaDeriveImage` on surfaces before any picture had been
+decoded; the bridge returned `VA_STATUS_ERROR_INVALID_SURFACE`, which Firefox
+treats as fatal (burst of `NS_ERROR_DOM_MEDIA_FATAL_ERR`, playback stops).
+`vaDeriveImage` now succeeds for undecoded surfaces and returns a zeroed image
+of the surface geometry, matching the VA spec (contents are undefined until
+decode). Verified: Firefox plays continuously (fatal errors only during the
+initial stream negotiation), Chromium unaffected. Commit `a14815c`.
+
 ## 13. Software de-tile cost *in situ*, and de-tiling straight into the bo (2026-10-20)
 
 The long-standing "~1.4 ms/frame @1080p (~4% of a core)" figure came from a
