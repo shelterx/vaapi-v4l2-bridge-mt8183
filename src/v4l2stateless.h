@@ -182,6 +182,26 @@ struct v4l2sl_m2m_state {
     struct v4l2_format ofmt; /* negotiated OUTPUT format (plane layout) */
 };
 
+/* MDP3 m2m HW de-tile state (MM21 -> NV12). Zero-copy: the decoder's MM21
+ * capture dma-buf is imported into the OUTPUT queue each frame; the
+ * CAPTURE queue's driver-allocated NV12 is mmap'd and read. If init fails
+ * (no node / queues / streaming) or after consecutive per-frame failures the
+ * HW path is disabled and the software de-tile is used instead. */
+struct v4l2sl_mdp3 {
+    int fd;             /* /dev/videoN (driver "mdp3"), -1 if absent */
+    int out_bufs;       /* OUTPUT queue buffer count */
+    int cap_bufs;       /* CAPTURE queue buffer count */
+    uint32_t cap_stride; /* NV12 capture bytesperline */
+    uint32_t cap_height; /* NV12 capture height (aligned) */
+    uint32_t cap_width;  /* NV12 capture width */
+    uint32_t cap_size;   /* NV12 capture plane size */
+    void *cap_map[V4L2SL_MAX_CAPTURE_BUFS]; /* mmap of CAPTURE plane 0 */
+    int fail_count;     /* consecutive HW detile failures */
+    int disabled;       /* HW disabled for this session (SW de-tile) */
+    int active;         /* init attempted + succeeded for this context */
+    int streaming;
+};
+
 /* Per-context state (one decode session) */
 struct v4l2sl_context {
     VAContextID context_id;
@@ -231,6 +251,12 @@ struct v4l2sl_context {
      * and de-tiled from this second pointer. NULL for single-plane formats. */
     void *capture_uv_ptr[V4L2SL_MAX_CAPTURE_BUFS];
     uint32_t capture_uv_size;
+    /* DMABUF-allocated capture: per-buffer dma-buf fds (Y / UV), set when the
+     * capture queue is allocated with V4L2_MEMORY_DMABUF so a frame can be
+     * imported into the MDP3 m2m de-tiler (zero-copy). -1 = not available. */
+    int capture_buf_fd[V4L2SL_MAX_CAPTURE_BUFS];
+    int capture_uv_fd[V4L2SL_MAX_CAPTURE_BUFS];
+    int capture_dmabuf;   /* capture queue allocated as DMABUF */
     int capture_buf_anon; /* calloc stub when ioctl hook is installed */
     int free_cap_bufs[V4L2SL_MAX_CAPTURE_BUFS];
     int n_free_cap;
@@ -275,6 +301,8 @@ struct v4l2sl_context {
     /* Persistent M2M queues (stateful devices: RGA VPP / VEPU JPEG) */
     struct v4l2sl_m2m_state vpp_q;
     struct v4l2sl_m2m_state jpeg_q;
+    /* MDP3 m2m HW de-tile (MM21 -> NV12); see v4l2sl_mdp3. */
+    struct v4l2sl_mdp3 mdp3;
 };
 
 /* Driver global state */
@@ -424,6 +452,12 @@ int v4l2sl_gbm_surface_sync(struct v4l2sl_surface *s);
 int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
                                    const uint8_t *ysrc, const uint8_t *usrc,
                                    uint32_t aw, uint32_t ah);
+/* Map the bo for writing (HW de-tile writes NV12 into it); unmap when done.
+ * Returns the mapped Y pointer (NULL on failure); *out_stride / *out_data
+ * receive the bo stride and the unmap handle. */
+void *v4l2sl_gbm_surface_map(struct v4l2sl_surface *s, uint32_t w, uint32_t h,
+                            uint32_t *out_stride, void **out_data);
+void v4l2sl_gbm_surface_unmap(struct v4l2sl_surface *s, void *ptr, void *data);
 /* Lazy memfd: refill the memfd snapshot from the bo when a CPU-readback
  * caller (vaGetImage / vaDeriveImage / VPP source) needs it after a
  * bo-only pull_capture. */
@@ -434,6 +468,10 @@ void v4l2sl_gbm_surface_destroy(struct v4l2sl_surface *s);
 VAStatus v4l2sl_surface_fill_prime_gbm(const struct v4l2sl_surface *surf,
                                        uint32_t flags, void *descriptor);
 int v4l2sl_capture_expbuf(struct v4l2sl_context *ctx, int buf_index);
+/* Export one plane of an MMAP capture buffer as a dma-buf (zero-copy import
+ * source for the MDP3 m2m de-tiler). Caller owns the returned fd. */
+int v4l2sl_capture_expbuf_plane(struct v4l2sl_context *ctx, int buf_index,
+                                int plane);
 int v4l2sl_claim_capture_for_export(struct v4l2sl_context *ctx,
                                    struct v4l2sl_surface *surf);
 int v4l2sl_expbuf_export_wanted(void);
@@ -449,6 +487,15 @@ int v4l2sl_submit_request(int request_fd);
  * directions + drop the plane mappings). Safe no-op on an unused queue;
  * call before the context's device fd goes away. */
 void v4l2sl_m2m_teardown(struct v4l2sl_context *ctx, struct v4l2sl_m2m_state *q);
+/* MDP3 m2m HW de-tile (v4l2stateless_mdp3.c). init returns 0 if the HW path
+ * is ready (node found, MM21-out/NV12-cap queues configured + streaming) or
+ * -1 (the software de-tile is used instead). detile imports the MM21 capture
+ * dma-buf of buf_index, DQBUFs the NV12, and copies it into dst (a linear
+ * NV12 buffer at dst_stride). fini tears the queues down. */
+int v4l2sl_mdp3_init(struct v4l2sl_context *ctx, int width, int height);
+int v4l2sl_mdp3_detile(struct v4l2sl_context *ctx, int buf_index,
+                       void *dst, uint32_t dst_stride);
+void v4l2sl_mdp3_fini(struct v4l2sl_context *ctx);
 /* One-pass decode-buffer collection shared by every codec translate. */
 void v4l2sl_collect_decode_buffers(struct v4l2sl_buffer **buffers, int n,
                                    struct v4l2sl_collected *cb);

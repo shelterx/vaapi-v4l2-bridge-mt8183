@@ -44,6 +44,7 @@ core_sources = files(
   'src/v4l2stateless_gbm.c',
   'src/v4l2stateless_jpeg.c',
   'src/v4l2stateless_vpp.c',
+  'src/v4l2stateless_mdp3.c',
 )
 
 # One source of truth: every driver source lives in this static library; the

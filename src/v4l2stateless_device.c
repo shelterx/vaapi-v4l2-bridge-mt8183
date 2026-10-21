@@ -1581,6 +1581,23 @@ int v4l2sl_capture_expbuf(struct v4l2sl_context *ctx, int buf_index)
     return exp.fd;
 }
 
+int v4l2sl_capture_expbuf_plane(struct v4l2sl_context *ctx, int buf_index,
+                                int plane)
+{
+    struct v4l2_exportbuffer exp;
+
+    if (!ctx || ctx->v4l2_fd < 0 || buf_index < 0 || plane < 0)
+        return -1;
+    memset(&exp, 0, sizeof(exp));
+    exp.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    exp.index = (unsigned)buf_index;
+    exp.plane = (unsigned)plane;
+    exp.flags = O_CLOEXEC | O_RDWR;
+    if (v4l2sl_xioctl(ctx->v4l2_fd, VIDIOC_EXPBUF, &exp) < 0)
+        return -1;
+    return exp.fd;
+}
+
 int v4l2sl_claim_capture_for_export(struct v4l2sl_context *ctx,
                                     struct v4l2sl_surface *surf)
 {

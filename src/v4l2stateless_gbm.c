@@ -253,6 +253,33 @@ static void detile_planes_to(const uint8_t *ysrc, const uint8_t *usrc,
         }
 }
 
+void *v4l2sl_gbm_surface_map(struct v4l2sl_surface *s, uint32_t w, uint32_t h,
+                            uint32_t *out_stride, void **out_data)
+{
+    uint32_t mstride = 0;
+    void *map_data = NULL;
+    void *dst;
+
+    if (!s || !s->gbm_bo)
+        return NULL;
+    dst = gbm_bo_map(s->gbm_bo, 0, 0, w, h + (h + 1) / 2,
+                     GBM_BO_TRANSFER_WRITE, &mstride, &map_data);
+    if (dst) {
+        if (out_stride)
+            *out_stride = mstride;
+        if (out_data)
+            *out_data = map_data;
+    }
+    return dst;
+}
+
+void v4l2sl_gbm_surface_unmap(struct v4l2sl_surface *s, void *ptr, void *data)
+{
+    (void)ptr;
+    if (s && s->gbm_bo && data)
+        gbm_bo_unmap(s->gbm_bo, data);
+}
+
 int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
                                    const uint8_t *ysrc, const uint8_t *usrc,
                                    uint32_t aw, uint32_t ah)
