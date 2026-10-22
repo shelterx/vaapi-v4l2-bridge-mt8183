@@ -364,31 +364,39 @@ static void *async_detile_main(void *arg)
     return NULL;
 }
 
-void v4l2sl_gbm_detile_wait(void)
+/* Join the in-flight job. The caller must hold g_adetile_lock; the worker
+ * never takes it (it only touches the capture maps and the bo), so joining
+ * under the lock is safe and makes wait+create atomic across contexts. */
+static void detile_join_locked(void)
 {
     struct timespec w0, w1;
     double waited;
 
-    pthread_mutex_lock(&g_adetile_lock);
-    if (g_adetile.active) {
-        clock_gettime(CLOCK_MONOTONIC, &w0);
-        pthread_join(g_adetile.th, NULL);
-        clock_gettime(CLOCK_MONOTONIC, &w1);
-        waited = ts_ms(&w0, &w1);
-        if (waited > 0.5 && getenv("V4L2SL_PROFILE")) {
-            static int n;
-            if (n++ < 20)
-                fprintf(stderr,
-                        "v4l2stateless: async wait blocked %.1f ms\n", waited);
-        }
-        g_adetile.active = 0;
-        if (!g_adetile.ok) {
-            g_adetile.failed_once = 1;
+    if (!g_adetile.active)
+        return;
+    clock_gettime(CLOCK_MONOTONIC, &w0);
+    pthread_join(g_adetile.th, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &w1);
+    waited = ts_ms(&w0, &w1);
+    if (waited > 0.5 && getenv("V4L2SL_PROFILE")) {
+        static int n;
+        if (n++ < 20)
             fprintf(stderr,
-                    "v4l2stateless: async de-tile job failed; using the "
-                    "synchronous path from now on\n");
-        }
+                    "v4l2stateless: async wait blocked %.1f ms\n", waited);
     }
+    g_adetile.active = 0;
+    if (!g_adetile.ok) {
+        g_adetile.failed_once = 1;
+        fprintf(stderr,
+                "v4l2stateless: async de-tile job failed; using the "
+                "synchronous path from now on\n");
+    }
+}
+
+void v4l2sl_gbm_detile_wait(void)
+{
+    pthread_mutex_lock(&g_adetile_lock);
+    detile_join_locked();
     pthread_mutex_unlock(&g_adetile_lock);
 }
 
@@ -400,11 +408,11 @@ int v4l2sl_gbm_surface_detile_async(struct v4l2sl_surface *s,
 
     if (!s || !s->gbm_bo || !ysrc || !usrc)
         return -1;
-    /* Finish the previous job first: the caller's frame N-1 was displayed
-     * with that bo, and its capture slot may be reused. */
-    v4l2sl_gbm_detile_wait();
-
     pthread_mutex_lock(&g_adetile_lock);
+    /* Finish the previous job first: the caller's frame N-1 was displayed
+     * with that bo, and its capture slot may be reused. Joined under the
+     * lock so a second context cannot start a job in between. */
+    detile_join_locked();
     if (g_adetile.failed_once) {
         pthread_mutex_unlock(&g_adetile_lock);
         return -1;
