@@ -479,18 +479,34 @@ static int64_t prof_now_us(void)
     return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
+static FILE *g_trace;
+
 static void prof_init(void)
 {
     const char *e = getenv("V4L2SL_PROFILE");
+    const char *tr = getenv("V4L2SL_TRACE");
+    int prof_on = e && e[0] && e[0] != '0';
+    int trace_on = tr && tr[0];
 
-    if (!e || !e[0] || e[0] == '0')
+    if (!prof_on && !trace_on)
         return;
-    g_prof.window = atoi(e);
+    g_prof.window = prof_on ? atoi(e) : 120;
     if (g_prof.window <= 0)
         g_prof.window = 120;
+    if (trace_on) {
+        g_trace = fopen(tr, "w");
+        if (g_trace) {
+            setvbuf(g_trace, NULL, _IOLBF, 0);
+            fprintf(g_trace,
+                    "rt_ms,t_us,decode_ms,detile_ms,pull_ms,wait_ms,job_wall_ms,job_cpu_ms\n");
+        }
+    }
     g_prof.enabled = 1;
-    fprintf(stderr, "v4l2stateless: profile on, window=%d frames\n",
-            g_prof.window);
+    if (prof_on)
+        fprintf(stderr, "v4l2stateless: profile on, window=%d frames\n",
+                g_prof.window);
+    if (g_trace)
+        fprintf(stderr, "v4l2stateless: trace -> %s\n", tr);
 }
 
 static void prof_report(void)
@@ -549,6 +565,17 @@ static void prof_frame(int64_t t0_us, int64_t t1_us, double decode_ms,
                 "v4l2stateless: profile slow frame decode=%.1f detile=%.1f "
                 "pull=%.1f\n",
                 decode_ms, detile_ms, pull_ms);
+    if (g_trace) {
+        struct timespec rt;
+        double jw = -1.0, jc = -1.0;
+
+        clock_gettime(CLOCK_REALTIME, &rt);
+        v4l2sl_gbm_detile_last_job(&jw, &jc);
+        fprintf(g_trace, "%.3f,%lld,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                rt.tv_sec * 1e3 + rt.tv_nsec / 1e6, (long long)t0_us,
+                decode_ms, detile_ms, pull_ms,
+                v4l2sl_gbm_detile_last_wait_ms(), jw, jc);
+    }
     g_prof.n++;
     prof_report();
     (void)t1_us;
@@ -1433,6 +1460,9 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
             v4l2sl_gbm_surface_detile_async(surf, src,
                                             ctx->capture_uv_ptr[buf_index],
                                             stride, alh) == 0) {
+            /* No inline de-tile: the job runs on the worker thread and its
+             * cost is in the job_* trace columns. */
+            g_prof_pending_detile = 0.0;
             surf->last_writer = V4L2SL_WRITER_BO;
             return 0;
         }

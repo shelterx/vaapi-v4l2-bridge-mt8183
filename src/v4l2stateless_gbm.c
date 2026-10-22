@@ -310,6 +310,16 @@ struct async_detile {
 
 static struct async_detile g_adetile;
 static pthread_mutex_t g_adetile_lock = PTHREAD_MUTEX_INITIALIZER;
+static double g_last_wait_ms;
+static double g_last_job_wall_ms;
+static double g_last_job_cpu_ms;
+
+double v4l2sl_gbm_detile_last_wait_ms(void) { return g_last_wait_ms; }
+void v4l2sl_gbm_detile_last_job(double *wall_ms, double *cpu_ms)
+{
+    *wall_ms = g_last_job_wall_ms;
+    *cpu_ms = g_last_job_cpu_ms;
+}
 
 /* Default ON: measured on MT8183 at 1080p60, overlapping the de-tile with
  * the next decode cuts dropped frames ~2.6x (34 -> 13 per 20 s on YouTube,
@@ -342,6 +352,8 @@ static void *async_detile_main(void *arg)
     clock_gettime(CLOCK_MONOTONIC, &w1);
     wall = ts_ms(&w0, &w1);
     cpu = ts_ms(&c0, &c1);
+    g_last_job_wall_ms = wall;
+    g_last_job_cpu_ms = cpu;
     if (wall > 8.0 && getenv("V4L2SL_PROFILE"))
         fprintf(stderr,
                 "v4l2stateless: async de-tile slow: wall=%.1f cpu=%.1f ms\n",
