@@ -614,6 +614,13 @@ static int decode_submit_inner(struct v4l2sl_context *ctx, int out_buf_idx,
     if (!ctx || ctx->v4l2_fd < 0 || ctx->request_fd < 0)
         return -1;
 
+    /* Re-decoding into a surface whose de-tile is still in flight would let
+     * the decoder overwrite the capture slot the worker is reading. Overlap
+     * stays intact for every other surface. */
+    if (ctx->current_surface &&
+        v4l2sl_gbm_detile_pending_for(ctx->current_surface))
+        v4l2sl_gbm_detile_wait();
+
     cap_buf_idx = -1;
     if (v4l2sl_expbuf_export_wanted() && ctx->current_surface &&
         ctx->current_surface->buf_index >= 0)

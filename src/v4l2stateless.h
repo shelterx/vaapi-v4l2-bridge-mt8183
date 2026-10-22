@@ -463,6 +463,8 @@ void v4l2sl_gbm_detile_wait(void);
 /* Metrics of the most recent async job, for V4L2SL_TRACE. */
 double v4l2sl_gbm_detile_last_wait_ms(void);
 void v4l2sl_gbm_detile_last_job(double *wall_ms, double *cpu_ms);
+/* True when the pending job is reading this surface's capture slot. */
+int v4l2sl_gbm_detile_pending_for(const struct v4l2sl_surface *s);
 /* Map the bo for writing (HW de-tile writes NV12 into it); unmap when done.
  * Returns the mapped Y pointer (NULL on failure); *out_stride / *out_data
  * receive the bo stride and the unmap handle. */

@@ -400,6 +400,17 @@ void v4l2sl_gbm_detile_wait(void)
     pthread_mutex_unlock(&g_adetile_lock);
 }
 
+/* True when the in-flight job is reading this surface's capture slot. */
+int v4l2sl_gbm_detile_pending_for(const struct v4l2sl_surface *s)
+{
+    int r;
+
+    pthread_mutex_lock(&g_adetile_lock);
+    r = g_adetile.active && g_adetile.surf == s;
+    pthread_mutex_unlock(&g_adetile_lock);
+    return r;
+}
+
 int v4l2sl_gbm_surface_detile_async(struct v4l2sl_surface *s,
                                     const uint8_t *ysrc, const uint8_t *usrc,
                                     uint32_t aw, uint32_t ah)
