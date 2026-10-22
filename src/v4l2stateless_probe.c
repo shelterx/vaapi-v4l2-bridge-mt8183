@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <linux/videodev2.h>
 #include <linux/media.h>
 
@@ -475,6 +476,29 @@ static int scan_all_uncached(char *h264_out, char *hevc_out, char *av1_out,
     return 0;
 }
 
+/* A cached entry is valid if it is empty (codec absent) or still points at a
+ * character device. This catches nodes that disappeared within a boot (module
+ * reload, unplug); renumbering to a different device cannot be detected this
+ * cheaply. */
+static int cache_entry_ok(const char *p)
+{
+    struct stat st;
+
+    if (!p || !p[0])
+        return 1;
+    return stat(p, &st) == 0 && S_ISCHR(st.st_mode);
+}
+
+static int cache_nodes_ok(const char *h264, const char *hevc, const char *av1,
+                          const char *vp8, const char *mpeg2,
+                          const char *jpeg, const char *vpp)
+{
+    return cache_entry_ok(h264) && cache_entry_ok(hevc) &&
+           cache_entry_ok(av1) && cache_entry_ok(vp8) &&
+           cache_entry_ok(mpeg2) && cache_entry_ok(jpeg) &&
+           cache_entry_ok(vpp);
+}
+
 int v4l2sl_scan_all_cached(char *h264_out, char *hevc_out, char *av1_out,
                            char *vp8_out, char *mpeg2_out,
                            char *jpeg_enc_out, char *vpp_out,
@@ -482,16 +506,32 @@ int v4l2sl_scan_all_cached(char *h264_out, char *hevc_out, char *av1_out,
 {
     char path[280];
     char boot[64];
+    int loaded = 0;
 
     probe_cache_path(path, sizeof(path));
+    if (h264_out && out_len) h264_out[0] = 0;
+    if (hevc_out && out_len) hevc_out[0] = 0;
+    if (av1_out && out_len) av1_out[0] = 0;
+    if (vp8_out && out_len) vp8_out[0] = 0;
+    if (mpeg2_out && out_len) mpeg2_out[0] = 0;
+    if (jpeg_enc_out && out_len) jpeg_enc_out[0] = 0;
+    if (vpp_out && out_len) vpp_out[0] = 0;
 
     if (!getenv("V4L2SL_PROBE_NOCACHE") &&
         probe_read_boot_id(boot, sizeof(boot)) == 0 &&
         probe_cache_load(path, boot, h264_out, hevc_out, av1_out, vp8_out,
                          mpeg2_out, jpeg_enc_out, vpp_out, out_len) == 0) {
-        fprintf(stderr, "v4l2stateless: probe cache hit (%s)\n", path);
-        return 0;
+        if (cache_nodes_ok(h264_out, hevc_out, av1_out, vp8_out, mpeg2_out,
+                           jpeg_enc_out, vpp_out)) {
+            fprintf(stderr, "v4l2stateless: probe cache hit (%s)\n", path);
+            return 0;
+        }
+        loaded = 1;
     }
+
+    if (loaded)
+        fprintf(stderr,
+                "v4l2stateless: probe cache stale (missing node), rescanning\n");
 
     scan_all_uncached(h264_out, hevc_out, av1_out, vp8_out, mpeg2_out,
                       jpeg_enc_out, vpp_out, out_len);
