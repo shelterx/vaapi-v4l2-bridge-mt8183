@@ -95,6 +95,9 @@ int v4l2sl_gbm_surface_upload(struct v4l2sl_surface *s, const void *src,
 
     if (!s || !s->gbm_bo || !src || !src_stride)
         return -1;
+    /* vaPutImage / sync() write the same bo a pending de-tile may be
+     * writing; join first so the two never interleave. */
+    v4l2sl_gbm_detile_wait();
     dst = gbm_bo_map(s->gbm_bo, 0, 0, w, h + (h + 1) / 2,
                      GBM_BO_TRANSFER_WRITE, &mstride, &map_data);
     if (!dst) {
