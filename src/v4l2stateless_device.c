@@ -37,6 +37,22 @@ static double g_prof_pending_decode = -1;
 static double g_prof_pending_detile = -1;
 static int64_t g_prof_pending_frame_us;
 
+/* V4L2SL_DETILE=sw|hw|gpu. The single parse: everything that keys off the
+ * de-tile choice (bo layout, MDP3 dispatch, pull dispatch) goes through this,
+ * because a disagreement between them misplaces chroma in the exported bo. */
+enum v4l2sl_detile_mode v4l2sl_detile_mode(void)
+{
+    const char *e = getenv("V4L2SL_DETILE");
+
+    if (!e || !e[0])
+        return V4L2SL_DETILE_SW;
+    if (e[0] == 'h' || e[0] == 'H')
+        return V4L2SL_DETILE_MDP3;
+    if (e[0] == 'g' || e[0] == 'G')
+        return V4L2SL_DETILE_GPU;
+    return V4L2SL_DETILE_SW;
+}
+
 void v4l2sl_set_ioctl_hook(v4l2sl_ioctl_fn fn)
 {
     g_ioctl_hook = fn;

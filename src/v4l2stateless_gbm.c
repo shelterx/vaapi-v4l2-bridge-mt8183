@@ -157,15 +157,16 @@ int v4l2sl_surface_ensure_memfd(struct v4l2sl_surface *s)
     return 0;
 }
 
-/* The MDP3 CAPTURE queue always negotiates an aligned height (e.g. 1088 for
- * 1080), so in hardware mode the bo must reserve that many luma rows and the
- * UV plane starts at stride*aligned_h. The software path keeps the visible
- * layout (UV at stride*height), so its behaviour is unchanged. */
+/* Both hardware writers (MDP3 and the GPU shader) emit linear NV12 whose UV
+ * plane starts at stride*aligned_h, because the MM21 capture geometry is the
+ * aligned one (e.g. 1088 rows for 1080) and the tiled source has no padding
+ * concept the shader could stop at.
+ *
+ * The software path keeps the visible layout (UV at stride*height), so its
+ * behaviour — and every buffer already handed to Chromium — is unchanged. */
 static int hw_layout_requested(void)
 {
-    const char *e = getenv("V4L2SL_DETILE");
-
-    return e && (e[0] == 'h' || e[0] == 'H');
+    return v4l2sl_detile_mode() != V4L2SL_DETILE_SW;
 }
 
 static uint32_t surface_uv_rows(const struct v4l2sl_surface *s)
