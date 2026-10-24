@@ -1385,27 +1385,34 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
     uint32_t sz, stride, alh, fcc;
     void *src, *dst;
 
+    int hw_try, mmapped = 0;
+
     if (!ctx || !surf || ctx->v4l2_fd < 0 || buf_index < 0)
         return -1;
     /* Remember which context allocated this slot so surface destroy can
      * return it to the right pool (see destroy_surface_locked). */
     surf->capture_owner = ctx;
-    if (v4l2sl_mmap_one_capture(ctx, buf_index) < 0)
-        return -1;
-    if (!ctx->capture_buf_ptr[buf_index] ||
-        ctx->capture_buf_ptr[buf_index] == MAP_FAILED)
-        return -1;
 
     stride = ctx->cap_stride ? ctx->cap_stride : (uint32_t)ctx->width;
     alh = ctx->cap_height ? ctx->cap_height : (uint32_t)ctx->height;
     fcc = ctx->cap_pixelformat ? ctx->cap_pixelformat : V4L2_PIX_FMT_NV12;
-    sz = ctx->capture_buf_size;
-    if (ctx->cap_sizeimage && ctx->cap_sizeimage < sz)
-        sz = ctx->cap_sizeimage;
-    if (!sz)
-        return -1;
 
-    src = ctx->capture_buf_ptr[buf_index];
+    /*
+     * The hardware de-tile reads the capture buffer through dma-bufs, never
+     * through the CPU mapping. Mapping a slot faults in ~2 MB of CMA that
+     * this path will not touch, so defer it until the software de-tile is
+     * actually needed (hardware disabled, failed, or a non-MM21 format).
+     */
+    hw_try = (fcc == V4L2_PIX_FMT_MM21) && surf->gbm_bo &&
+             !ctx->mdp3.disabled && v4l2sl_mdp3_requested();
+    if (!hw_try) {
+        if (v4l2sl_mmap_one_capture(ctx, buf_index) < 0)
+            return -1;
+        if (!ctx->capture_buf_ptr[buf_index] ||
+            ctx->capture_buf_ptr[buf_index] == MAP_FAILED)
+            return -1;
+        mmapped = 1;
+    }
 
     if (fcc == V4L2_PIX_FMT_MM21) {
         /*
@@ -1415,8 +1422,6 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
          * tiled format. Output is stride*alh*3/2 (NV12), larger than the Y
          * plane alone, so size the memfd to the de-tiled size.
          */
-        if (!ctx->capture_uv_ptr[buf_index])
-            return -1; /* MM21 needs both Y and UV planes mapped */
         v4l2sl_explog("v4l2stateless: pull_capture MM21 idx=%d\n", buf_index);
         surf->has_pic = 1;
         surf->buf_index = buf_index;
@@ -1445,23 +1450,51 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
                 if (v4l2sl_mdp3_init(ctx, (int)stride, (int)alh) < 0)
                     ctx->mdp3.disabled = 1;
             }
+            if (!ctx->mdp3.disabled && v4l2sl_gbm_detile_async_wanted()) {
+                /* MDP3 imports the surface bo directly (zero-copy). The decoder
+                 * planes are exported here so the worker never issues ioctls on
+                 * the decoder fd while the next frame is being decoded. */
+                int y_fd = v4l2sl_capture_expbuf_plane(ctx, buf_index, 0);
+                int uv_fd = y_fd >= 0
+                                ? v4l2sl_capture_expbuf_plane(ctx, buf_index, 1)
+                                : -1;
+
+                if (uv_fd >= 0 &&
+                    v4l2sl_gbm_detile_async_hw(ctx, surf, y_fd, uv_fd) == 0) {
+                    g_prof_pending_detile = 0.0;
+                    surf->last_writer = V4L2SL_WRITER_BO;
+                    return 0;
+                }
+                if (y_fd >= 0)
+                    close(y_fd);
+                if (uv_fd >= 0)
+                    close(uv_fd);
+            }
             if (!ctx->mdp3.disabled) {
-                uint32_t bo_stride = 0;
-                void *bo_data = NULL;
-                void *bo = v4l2sl_gbm_surface_map(surf, (uint32_t)surf->width,
-                                                  (uint32_t)surf->height,
-                                                  &bo_stride, &bo_data);
-                int ok = bo &&
-                    v4l2sl_mdp3_detile(ctx, buf_index, bo, bo_stride) == 0;
-                if (bo)
-                    v4l2sl_gbm_surface_unmap(surf, bo, bo_data);
-                if (ok) {
+                if (v4l2sl_mdp3_detile(ctx, buf_index, surf) == 0) {
                     PROF_DETILE_END();
                     surf->last_writer = V4L2SL_WRITER_BO;
                     return 0;
                 }
             }
         }
+
+        /* Software fallback: now the capture buffer must be CPU-mapped. */
+        if (!mmapped) {
+            if (v4l2sl_mmap_one_capture(ctx, buf_index) < 0)
+                return -1;
+            if (!ctx->capture_buf_ptr[buf_index] ||
+                ctx->capture_buf_ptr[buf_index] == MAP_FAILED ||
+                !ctx->capture_uv_ptr[buf_index])
+                return -1;
+            mmapped = 1;
+        }
+        src = ctx->capture_buf_ptr[buf_index];
+        sz = ctx->capture_buf_size;
+        if (ctx->cap_sizeimage && ctx->cap_sizeimage < sz)
+            sz = ctx->cap_sizeimage;
+        if (!sz)
+            return -1;
 
         if (surf->gbm_bo && v4l2sl_gbm_detile_async_wanted() &&
             v4l2sl_gbm_surface_detile_async(surf, src,
@@ -1511,6 +1544,21 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
             (void)v4l2sl_gbm_surface_sync(surf);
         return 0;
     }
+    /* Non-tiled capture (linear formats): hand out the capture mapping
+     * directly, so the slot must be mapped here. */
+    if (!mmapped) {
+        if (v4l2sl_mmap_one_capture(ctx, buf_index) < 0)
+            return -1;
+        if (!ctx->capture_buf_ptr[buf_index] ||
+            ctx->capture_buf_ptr[buf_index] == MAP_FAILED)
+            return -1;
+    }
+    src = ctx->capture_buf_ptr[buf_index];
+    sz = ctx->capture_buf_size;
+    if (ctx->cap_sizeimage && ctx->cap_sizeimage < sz)
+        sz = ctx->cap_sizeimage;
+    if (!sz)
+        return -1;
     surf->de_tiled = 0;
 
     if (v4l2sl_expbuf_export_wanted()) {

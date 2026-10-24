@@ -89,6 +89,7 @@ int v4l2sl_gbm_surface_upload(struct v4l2sl_surface *s, const void *src,
                               uint32_t src_stride, uint32_t src_alh)
 {
     uint32_t w = s->width, h = s->height;
+    uint32_t uv = s ? (s->bo_uv_rows ? s->bo_uv_rows : h) : h;
     uint8_t *dst;
     void *map_data = NULL;
     uint32_t mstride = 0;
@@ -98,14 +99,14 @@ int v4l2sl_gbm_surface_upload(struct v4l2sl_surface *s, const void *src,
     /* vaPutImage / sync() write the same bo a pending de-tile may be
      * writing; join first so the two never interleave. */
     v4l2sl_gbm_detile_wait();
-    dst = gbm_bo_map(s->gbm_bo, 0, 0, w, h + (h + 1) / 2,
+    dst = gbm_bo_map(s->gbm_bo, 0, 0, w, uv + (uv + 1) / 2,
                      GBM_BO_TRANSFER_WRITE, &mstride, &map_data);
     if (!dst) {
         fprintf(stderr, "v4l2stateless: gbm: bo map failed\n");
         return -1;
     }
     copy_plane(dst, mstride, src, src_stride, w, h);
-    copy_plane(dst + (size_t)mstride * h, mstride,
+    copy_plane(dst + (size_t)mstride * uv, mstride,
                (const uint8_t *)src + (size_t)src_stride * src_alh,
                src_stride, w + (w & 1), (h + 1) / 2);
     gbm_bo_unmap(s->gbm_bo, map_data);
@@ -130,10 +131,11 @@ int v4l2sl_surface_ensure_memfd(struct v4l2sl_surface *s)
     w = s->width;
     h = s->height;
     uvw = w + (w & 1);
+    uint32_t uv = s->bo_uv_rows ? s->bo_uv_rows : h;
     sz = v4l2sl_capture_plane_size(V4L2_PIX_FMT_NV12, s->stride, s->aligned_h);
     if (v4l2sl_surface_grow_memfd(s, sz) < 0)
         return -1;
-    bo_data = gbm_bo_map(s->gbm_bo, 0, 0, w, h + (h + 1) / 2,
+    bo_data = gbm_bo_map(s->gbm_bo, 0, 0, w, uv + (uv + 1) / 2,
                          GBM_BO_TRANSFER_READ, &bo_stride, &bo_map);
     if (!bo_data)
         return -1;
@@ -149,10 +151,32 @@ int v4l2sl_surface_ensure_memfd(struct v4l2sl_surface *s)
     dst = (uint8_t *)m + (size_t)s->stride * s->aligned_h;
     for (uint32_t y = 0; y < (h + 1) / 2; y++)
         memcpy(dst + (size_t)s->stride * y,
-               bo_data + (size_t)bo_stride * (h + y), uvw);
+               bo_data + (size_t)bo_stride * (uv + y), uvw);
     gbm_bo_unmap(s->gbm_bo, bo_map);
     s->last_writer = V4L2SL_WRITER_MEMFD;
     return 0;
+}
+
+/* The MDP3 CAPTURE queue always negotiates an aligned height (e.g. 1088 for
+ * 1080), so in hardware mode the bo must reserve that many luma rows and the
+ * UV plane starts at stride*aligned_h. The software path keeps the visible
+ * layout (UV at stride*height), so its behaviour is unchanged. */
+static int hw_layout_requested(void)
+{
+    const char *e = getenv("V4L2SL_DETILE");
+
+    return e && (e[0] == 'h' || e[0] == 'H');
+}
+
+static uint32_t surface_uv_rows(const struct v4l2sl_surface *s)
+{
+    if (!hw_layout_requested())
+        return s->height;
+    if (s->aligned_h)
+        return s->aligned_h;
+    if (s->capture_owner && s->capture_owner->cap_height)
+        return s->capture_owner->cap_height;
+    return (s->height + 63) & ~63u;
 }
 
 int v4l2sl_gbm_surface_ensure(struct v4l2sl_surface *s)
@@ -175,7 +199,8 @@ int v4l2sl_gbm_surface_ensure(struct v4l2sl_surface *s)
     dev = v4l2sl_gbm_device();
     if (!dev)
         return -1;
-    rows = s->height + (s->height + 1) / 2;
+    s->bo_uv_rows = surface_uv_rows(s);
+    rows = s->bo_uv_rows + (s->bo_uv_rows + 1) / 2;
     s->gbm_bo = gbm_bo_create(dev, s->width, rows, GBM_FORMAT_R8,
                               GBM_BO_USE_LINEAR);
     if (!s->gbm_bo) {
@@ -309,6 +334,11 @@ struct async_detile {
     const uint8_t *usrc;
     uint32_t aw;
     uint32_t ah;
+    /* Hardware (MDP3) job: decoder capture dma-bufs, exported by the caller. */
+    int hw;
+    struct v4l2sl_context *ctx;
+    int y_fd;
+    int uv_fd;
 };
 
 static struct async_detile g_adetile;
@@ -349,18 +379,23 @@ static void *async_detile_main(void *arg)
 
     clock_gettime(CLOCK_MONOTONIC, &w0);
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c0);
-    a->ok = v4l2sl_gbm_surface_detile_mm21(a->surf, a->ysrc, a->usrc,
-                                           a->aw, a->ah) == 0;
+    if (a->hw)
+        a->ok = v4l2sl_mdp3_detile_prepared(a->ctx, a->surf,
+                                            a->y_fd, a->uv_fd) == 0;
+    else
+        a->ok = v4l2sl_gbm_surface_detile_mm21(a->surf, a->ysrc, a->usrc,
+                                              a->aw, a->ah) == 0;
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c1);
     clock_gettime(CLOCK_MONOTONIC, &w1);
     wall = ts_ms(&w0, &w1);
     cpu = ts_ms(&c0, &c1);
     g_last_job_wall_ms = wall;
     g_last_job_cpu_ms = cpu;
-    if (wall > 8.0 && getenv("V4L2SL_PROFILE"))
+    /* The MDP3 job is expected to take ~10 ms; only flag real outliers. */
+    if (wall > (a->hw ? 20.0 : 8.0) && getenv("V4L2SL_PROFILE"))
         fprintf(stderr,
-                "v4l2stateless: async de-tile slow: wall=%.1f cpu=%.1f ms\n",
-                wall, cpu);
+                "v4l2stateless: async de-tile slow: hw=%d wall=%.1f cpu=%.1f ms\n",
+                a->hw, wall, cpu);
     return NULL;
 }
 
@@ -411,6 +446,38 @@ int v4l2sl_gbm_detile_pending_for(const struct v4l2sl_surface *s)
     return r;
 }
 
+/* Hardware variant: the caller has already EXPBUF'd the decoder capture
+ * planes, so the worker only talks to the MDP3 device (never the decoder fd).
+ * Takes ownership of both fds. */
+int v4l2sl_gbm_detile_async_hw(struct v4l2sl_context *ctx,
+                               struct v4l2sl_surface *s, int y_fd, int uv_fd)
+{
+    int rc;
+
+    if (!ctx || !s || !s->gbm_bo || y_fd < 0 || uv_fd < 0)
+        return -1;
+    pthread_mutex_lock(&g_adetile_lock);
+    detile_join_locked();
+    if (g_adetile.failed_once) {
+        pthread_mutex_unlock(&g_adetile_lock);
+        return -1;
+    }
+    g_adetile.hw = 1;
+    g_adetile.ctx = ctx;
+    g_adetile.surf = s;
+    g_adetile.y_fd = y_fd;
+    g_adetile.uv_fd = uv_fd;
+    g_adetile.ok = 0;
+    rc = pthread_create(&g_adetile.th, NULL, async_detile_main, &g_adetile);
+    if (rc == 0) {
+        g_adetile.active = 1;
+    } else {
+        g_adetile.hw = 0;
+    }
+    pthread_mutex_unlock(&g_adetile_lock);
+    return rc == 0 ? 0 : -1;
+}
+
 int v4l2sl_gbm_surface_detile_async(struct v4l2sl_surface *s,
                                     const uint8_t *ysrc, const uint8_t *usrc,
                                     uint32_t aw, uint32_t ah)
@@ -428,6 +495,10 @@ int v4l2sl_gbm_surface_detile_async(struct v4l2sl_surface *s,
         pthread_mutex_unlock(&g_adetile_lock);
         return -1;
     }
+    g_adetile.hw = 0;
+    g_adetile.ctx = NULL;
+    g_adetile.y_fd = -1;
+    g_adetile.uv_fd = -1;
     g_adetile.surf = s;
     g_adetile.ysrc = ysrc;
     g_adetile.usrc = usrc;
@@ -450,9 +521,11 @@ int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
     uint32_t mstride = 0;
     uint8_t *dst;
 
+    uint32_t uv = s ? (s->bo_uv_rows ? s->bo_uv_rows : h) : h;
+
     if (!s || !s->gbm_bo || !ysrc || !usrc)
         return -1;
-    dst = gbm_bo_map(s->gbm_bo, 0, 0, w, h + (h + 1) / 2,
+    dst = gbm_bo_map(s->gbm_bo, 0, 0, w, uv + (uv + 1) / 2,
                      GBM_BO_TRANSFER_WRITE, &mstride, &map_data);
     if (!dst)
         return -1;
@@ -461,7 +534,7 @@ int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
         return -1;
     }
     detile_planes_to(ysrc, usrc, dst, mstride,
-                     dst + (size_t)mstride * h, mstride, aw, ah, h);
+                     dst + (size_t)mstride * uv, mstride, aw, ah, h);
     gbm_bo_unmap(s->gbm_bo, map_data);
     return 0;
 }
@@ -491,10 +564,14 @@ VAStatus v4l2sl_surface_fill_prime_gbm(const struct v4l2sl_surface *surf,
 
     h = surf->height;
     pitch = surf->gbm_stride;
-    v4l2sl_fill_prime_layers(desc, fd, pitch * (h + (h + 1) / 2),
-                             gbm_bo_get_modifier(surf->gbm_bo),
-                             VA_FOURCC_NV12, surf->width, h, pitch, h,
-                             DRM_FORMAT_NV12, DRM_FORMAT_R8, DRM_FORMAT_GR88,
-                             flags);
+    {
+        uint32_t uv = surf->bo_uv_rows ? surf->bo_uv_rows : h;
+
+        v4l2sl_fill_prime_layers(desc, fd, pitch * (uv + (uv + 1) / 2),
+                                 gbm_bo_get_modifier(surf->gbm_bo),
+                                 VA_FOURCC_NV12, surf->width, h, pitch, uv,
+                                 DRM_FORMAT_NV12, DRM_FORMAT_R8,
+                                 DRM_FORMAT_GR88, flags);
+    }
     return VA_STATUS_SUCCESS;
 }

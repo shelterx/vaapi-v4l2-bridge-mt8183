@@ -32,6 +32,7 @@
 #include <unistd.h>
 
 #include <linux/videodev2.h>
+#include <gbm.h>
 
 #include "v4l2stateless.h"
 
@@ -40,6 +41,47 @@
 #endif
 
 #define MDP3_NBUFS         4
+
+/* Stage timing (V4L2SL_PROFILE): shows how much of a job is dma-buf import
+ * (QBUF) versus the wait for the hardware. */
+static double g_stage[5];
+static unsigned g_stage_n;
+
+static int mdp3_time_stages(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+        on = getenv("V4L2SL_PROFILE") ? 1 : 0;
+    return on;
+}
+
+static double mdp3_now_ms(void)
+{
+    struct timespec t;
+
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+}
+
+static void mdp3_stage(int i, double ms)
+{
+    if (mdp3_time_stages())
+        g_stage[i] += ms;
+}
+
+static void mdp3_stage_report(void)
+{
+    if (mdp3_time_stages() && ++g_stage_n % 120 == 0) {
+        fprintf(stderr,
+                "v4l2stateless: mdp3 stages avg ms: qcap=%.2f qout=%.2f "
+                "poll=%.2f dcap=%.2f dout=%.2f\n",
+                g_stage[0] / 120, g_stage[1] / 120, g_stage[2] / 120,
+                g_stage[3] / 120, g_stage[4] / 120);
+        for (int i = 0; i < 5; i++)
+            g_stage[i] = 0;
+    }
+}
 #define MDP3_DQ_TIMEOUT_MS 2000
 #define MDP3_FAIL_LIMIT    3   /* consecutive failures -> disable for session */
 
@@ -73,6 +115,13 @@ static int mdp3_forced_on(void)
     return e && (e[0] == 'h' || e[0] == 'H');
 }
 
+/* True when the caller asked for the hardware de-tile (V4L2SL_DETILE=hw),
+ * regardless of whether init has run yet. */
+int v4l2sl_mdp3_requested(void)
+{
+    return mdp3_forced_on();
+}
+
 static int mdp3_stream(int fd, uint32_t type, int on)
 {
     uint32_t t = type;   /* STREAMON/OFF take a pointer to a __u32 */
@@ -82,19 +131,12 @@ static int mdp3_stream(int fd, uint32_t type, int on)
 
 static void mdp3_release(void)
 {
-    int i;
-
     if (g_mdp3.fd < 0)
         return;
     if (g_mdp3.streaming) {
         mdp3_stream(g_mdp3.fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, 0);
         mdp3_stream(g_mdp3.fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, 0);
         g_mdp3.streaming = 0;
-    }
-    for (i = 0; i < g_mdp3.cap_bufs; i++) {
-        if (g_mdp3.cap_map[i] && g_mdp3.cap_map[i] != MAP_FAILED)
-            munmap(g_mdp3.cap_map[i], g_mdp3.cap_size);
-        g_mdp3.cap_map[i] = NULL;
     }
     mdp3_reqbufs(g_mdp3.fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, 0, V4L2_MEMORY_MMAP);
     mdp3_reqbufs(g_mdp3.fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, 0, V4L2_MEMORY_DMABUF);
@@ -103,6 +145,27 @@ static void mdp3_release(void)
     g_mdp3.out_bufs = 0;
     g_mdp3.cap_bufs = 0;
     g_mdp3_owner = NULL;
+}
+
+/* Decoder plane sizes without requiring the CPU mapping (the hardware path
+ * deliberately does not map the capture slot). */
+static uint32_t src_y_size(struct v4l2sl_context *ctx)
+{
+    if (ctx->capture_buf_size)
+        return ctx->capture_buf_size;
+    if (ctx->cap_stride && ctx->cap_height)
+        return ctx->cap_stride * ctx->cap_height;
+    return ctx->cap_sizeimage;
+}
+
+static uint32_t src_uv_size(struct v4l2sl_context *ctx)
+{
+    uint32_t y;
+
+    if (ctx->capture_uv_size)
+        return ctx->capture_uv_size;
+    y = src_y_size(ctx);
+    return y / 2;
 }
 
 /* Count a HW failure; give up on the HW path after MDP3_FAIL_LIMIT in a row
@@ -179,7 +242,6 @@ int v4l2sl_mdp3_init(struct v4l2sl_context *ctx, int width, int height)
     char path[32] = "?";
     struct v4l2_pix_format_mplane omp, cmp;
     uint32_t y_size, uv_size;
-    int i;
 
     if (!ctx)
         return -1;
@@ -210,8 +272,8 @@ int v4l2sl_mdp3_init(struct v4l2sl_context *ctx, int width, int height)
     }
 
     /* The m2m needs the decoder's real capture geometry (aligned height). */
-    y_size = ctx->capture_buf_size;
-    uv_size = ctx->capture_uv_size;
+    y_size = src_y_size(ctx);
+    uv_size = src_uv_size(ctx);
     if (width <= 0 || height <= 0 || !y_size || !uv_size) {
         ctx->mdp3.disabled = 1;
         return -1;
@@ -250,7 +312,9 @@ int v4l2sl_mdp3_init(struct v4l2sl_context *ctx, int width, int height)
     }
 
     /* OUTPUT: dma-buf slots (the decoder's exported MM21 planes are imported
-     * at QBUF). CAPTURE: driver-allocated linear NV12 (MMAP + mmap below). */
+     * at QBUF). CAPTURE: dma-buf slots too — the surface's GBM bo is imported
+     * each frame, so MDP3 writes the final linear NV12 directly and there is
+     * no readback/copy at all. */
     g_mdp3.out_bufs = mdp3_reqbufs(g_mdp3.fd,
                                    V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
                                    MDP3_NBUFS, V4L2_MEMORY_DMABUF);
@@ -261,7 +325,7 @@ int v4l2sl_mdp3_init(struct v4l2sl_context *ctx, int width, int height)
     }
     g_mdp3.cap_bufs = mdp3_reqbufs(g_mdp3.fd,
                                    V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-                                   MDP3_NBUFS, V4L2_MEMORY_MMAP);
+                                   MDP3_NBUFS, V4L2_MEMORY_DMABUF);
     if (g_mdp3.cap_bufs < 0) {
         fprintf(stderr, "v4l2stateless: mdp3 REQBUFS cap failed: %s\n",
                 strerror(errno));
@@ -274,45 +338,6 @@ int v4l2sl_mdp3_init(struct v4l2sl_context *ctx, int width, int height)
     g_mdp3.cap_width = cmp.width;
     g_mdp3.cap_height = cmp.height;
     g_mdp3.cap_size = cmp.plane_fmt[0].sizeimage;
-
-    /* QUERYBUF + mmap each CAPTURE buffer (driver-allocated linear NV12). */
-    for (i = 0; i < g_mdp3.cap_bufs; i++) {
-        struct v4l2_buffer b = { 0 };
-        struct v4l2_plane plane = { 0 };
-
-        b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        b.index = (unsigned)i;
-        b.memory = V4L2_MEMORY_MMAP;
-        b.length = 1;
-        b.m.planes = &plane;
-        if (ioctl(g_mdp3.fd, VIDIOC_QUERYBUF, &b) < 0) {
-            fprintf(stderr, "v4l2stateless: mdp3 QUERYBUF cap[%d] failed: %s\n",
-                    i, strerror(errno));
-            goto fail;
-        }
-        g_mdp3.cap_map[i] = mmap(NULL, plane.length,
-                                 PROT_READ | PROT_WRITE, MAP_SHARED,
-                                 g_mdp3.fd, plane.m.mem_offset);
-        if (g_mdp3.cap_map[i] == MAP_FAILED) {
-            g_mdp3.cap_map[i] = NULL;
-            fprintf(stderr, "v4l2stateless: mdp3 mmap cap[%d] failed: %s\n",
-                    i, strerror(errno));
-            goto fail;
-        }
-        /* Pre-queue it so a destination is always available. */
-        memset(&b, 0, sizeof(b));
-        memset(&plane, 0, sizeof(plane));
-        b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        b.index = (unsigned)i;
-        b.memory = V4L2_MEMORY_MMAP;
-        b.length = 1;
-        b.m.planes = &plane;
-        if (ioctl(g_mdp3.fd, VIDIOC_QBUF, &b) < 0) {
-            fprintf(stderr, "v4l2stateless: mdp3 QBUF cap[%d] failed: %s\n",
-                    i, strerror(errno));
-            goto fail;
-        }
-    }
 
     /* The m2m framework starts a job only when BOTH queues are streaming
      * (mtk-mdp3 does not set ignore_cap_streaming). */
@@ -343,40 +368,69 @@ fail:
     return -1;
 }
 
-int v4l2sl_mdp3_detile(struct v4l2sl_context *ctx, int buf_index,
-                       void *dst, uint32_t dst_stride)
+/* Run one MDP3 job with the decoder capture planes already exported. Used by
+ * both the synchronous path and the async worker; takes ownership of y_fd and
+ * uv_fd (closed once vb2 has referenced them). */
+int v4l2sl_mdp3_detile_prepared(struct v4l2sl_context *ctx,
+                                struct v4l2sl_surface *surf,
+                                int y_fd, int uv_fd)
 {
     struct v4l2_buffer b = { 0 };
     struct v4l2_plane planes[2] = { 0 };
     struct pollfd pfd;
-    uint32_t y_size, uv_size;
-    int cap_done, y_fd, uv_fd, err;
+    uint32_t y_size, uv_size, bo_rows;
+    int cap_done, bo_fd, err;
 
-    if (!ctx || !dst || ctx->mdp3.disabled || g_mdp3.fd < 0 ||
-        g_mdp3_owner != ctx || buf_index < 0)
+    if (!ctx || !surf || !surf->gbm_bo || ctx->mdp3.disabled ||
+        g_mdp3.fd < 0 || g_mdp3_owner != ctx || y_fd < 0 || uv_fd < 0) {
+        if (y_fd >= 0)
+            close(y_fd);
+        if (uv_fd >= 0)
+            close(uv_fd);
         return -1;
+    }
 
-    y_size = ctx->capture_buf_size;
-    uv_size = ctx->capture_uv_size;
-    if (!y_size || !uv_size)
-        return -1;
-    if (dst_stride < g_mdp3.cap_stride)
-        return -1;   /* bo narrower than the capture: caller falls back */
-
-    /*
-     * Zero-copy input: export the decoder's two MM21 capture planes. The
-     * OUTPUT slot is reused serially and dequeued after every job: a queued
-     * DMABUF slot holds the previous dma-buf, so recycling it without DQBUF
-     * would fail EBUSY once the ring wraps (4 frames).
-     */
-    y_fd = v4l2sl_capture_expbuf_plane(ctx, buf_index, 0);
-    if (y_fd < 0)
-        return mdp3_fail(ctx, "EXPBUF Y", errno);
-    uv_fd = v4l2sl_capture_expbuf_plane(ctx, buf_index, 1);
-    if (uv_fd < 0) {
-        err = errno;
+    y_size = src_y_size(ctx);
+    uv_size = src_uv_size(ctx);
+    bo_rows = surf->bo_uv_rows;
+    if (!y_size || !uv_size || !bo_rows ||
+        surf->gbm_stride < g_mdp3.cap_stride ||
+        (uint64_t)surf->gbm_stride * (bo_rows + (bo_rows + 1) / 2) <
+            g_mdp3.cap_size) {
         close(y_fd);
-        return mdp3_fail(ctx, "EXPBUF UV", err);
+        close(uv_fd);
+        return -1;
+    }
+
+    /* Zero-copy output: import the surface's GBM bo as the CAPTURE buffer,
+     * so the NV12 result is written straight into what Chromium samples. */
+    bo_fd = gbm_bo_get_fd(surf->gbm_bo);
+    if (bo_fd < 0) {
+        close(y_fd);
+        close(uv_fd);
+        return mdp3_fail(ctx, "gbm_bo_get_fd", errno);
+    }
+
+    memset(&b, 0, sizeof(b));
+    memset(planes, 0, sizeof(planes));
+    b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    b.index = 0;
+    b.memory = V4L2_MEMORY_DMABUF;
+    b.length = 1;
+    b.m.planes = planes;
+    planes[0].m.fd = bo_fd;
+    planes[0].length = g_mdp3.cap_size;
+    {
+        double t0 = mdp3_now_ms();
+
+        err = ioctl(g_mdp3.fd, VIDIOC_QBUF, &b) < 0 ? errno : 0;
+        mdp3_stage(0, mdp3_now_ms() - t0);
+    }
+    close(bo_fd);
+    if (err) {
+        close(y_fd);
+        close(uv_fd);
+        return mdp3_fail(ctx, "QBUF cap bo", err);
     }
 
     memset(&b, 0, sizeof(b));
@@ -390,41 +444,47 @@ int v4l2sl_mdp3_detile(struct v4l2sl_context *ctx, int buf_index,
     planes[0].length = y_size;
     planes[1].m.fd = uv_fd;
     planes[1].length = uv_size;
-    err = ioctl(g_mdp3.fd, VIDIOC_QBUF, &b) < 0 ? errno : 0;
+    {
+        double t0 = mdp3_now_ms();
+
+        err = ioctl(g_mdp3.fd, VIDIOC_QBUF, &b) < 0 ? errno : 0;
+        mdp3_stage(1, mdp3_now_ms() - t0);
+    }
     /* vb2 takes its own dma-buf reference at QBUF; the fds can go now. */
     close(y_fd);
     close(uv_fd);
     if (err)
         return mdp3_fail(ctx, "QBUF in", err);
 
-    /* The driver pairs the queued OUTPUT with the oldest queued CAPTURE and
-     * runs the job; DQBUF returns the completed CAPTURE (linear NV12). */
+    /* The driver pairs the queued OUTPUT with the queued CAPTURE and runs the
+     * job; DQBUF returns the completed CAPTURE, already in the bo. */
     pfd.fd = g_mdp3.fd;
     pfd.events = POLLIN;
-    if (poll(&pfd, 1, MDP3_DQ_TIMEOUT_MS) <= 0)
-        return mdp3_fail(ctx, "poll timeout", 0);
+    {
+        double t0 = mdp3_now_ms();
+        int pr = poll(&pfd, 1, MDP3_DQ_TIMEOUT_MS);
+
+        mdp3_stage(2, mdp3_now_ms() - t0);
+        if (pr <= 0)
+            return mdp3_fail(ctx, "poll timeout", 0);
+    }
 
     memset(&b, 0, sizeof(b));
     memset(planes, 0, sizeof(planes));
     b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    b.memory = V4L2_MEMORY_MMAP;
+    b.memory = V4L2_MEMORY_DMABUF;
     b.length = 1;
     b.m.planes = planes;
-    if (ioctl(g_mdp3.fd, VIDIOC_DQBUF, &b) < 0)
-        return mdp3_fail(ctx, "DQBUF cap", errno);
-    cap_done = (int)b.index;
-    if (cap_done < 0 || cap_done >= g_mdp3.cap_bufs ||
-        !g_mdp3.cap_map[cap_done])
-        return mdp3_fail(ctx, "bad capture index", 0);
+    {
+        double t0 = mdp3_now_ms();
 
-    /* One linear NV12 pass: mdp3 capture -> surface bo. */
-    v4l2sl_copy_nv12((uint8_t *)dst, dst_stride,
-                     (const uint8_t *)g_mdp3.cap_map[cap_done],
-                     g_mdp3.cap_stride, g_mdp3.cap_height,
-                     ctx->width < (int)g_mdp3.cap_stride
-                         ? ctx->width : (int)g_mdp3.cap_stride,
-                     ctx->height < (int)g_mdp3.cap_height
-                         ? ctx->height : (int)g_mdp3.cap_height);
+        if (ioctl(g_mdp3.fd, VIDIOC_DQBUF, &b) < 0)
+            return mdp3_fail(ctx, "DQBUF cap", errno);
+        mdp3_stage(3, mdp3_now_ms() - t0);
+    }
+    cap_done = (int)b.index;
+    if (cap_done < 0 || cap_done >= g_mdp3.cap_bufs)
+        return mdp3_fail(ctx, "bad capture index", 0);
 
     /* Release the (now completed) OUTPUT buffer so its slot can be reused. */
     memset(&b, 0, sizeof(b));
@@ -433,25 +493,44 @@ int v4l2sl_mdp3_detile(struct v4l2sl_context *ctx, int buf_index,
     b.memory = V4L2_MEMORY_DMABUF;
     b.length = 2;
     b.m.planes = planes;
-    if (ioctl(g_mdp3.fd, VIDIOC_DQBUF, &b) < 0)
-        return mdp3_fail(ctx, "DQBUF in", errno);
+    {
+        double t0 = mdp3_now_ms();
 
-    /* Re-queue the completed CAPTURE so a destination is always available. */
-    memset(&b, 0, sizeof(b));
-    memset(planes, 0, sizeof(planes));
-    b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    b.index = (unsigned)cap_done;
-    b.memory = V4L2_MEMORY_MMAP;
-    b.length = 1;
-    b.m.planes = planes;
-    if (ioctl(g_mdp3.fd, VIDIOC_QBUF, &b) < 0)
-        return mdp3_fail(ctx, "QBUF cap", errno);
+        if (ioctl(g_mdp3.fd, VIDIOC_DQBUF, &b) < 0)
+            return mdp3_fail(ctx, "DQBUF in", errno);
+        mdp3_stage(4, mdp3_now_ms() - t0);
+    }
 
+    mdp3_stage_report();
     ctx->mdp3.fail_count = 0;
     if (mdp3_log())
-        fprintf(stderr, "v4l2stateless: mdp3 detile idx=%d cap=%d (HW)\n",
-                buf_index, cap_done);
+        fprintf(stderr,
+                "v4l2stateless: mdp3 detile cap=%d (HW zero-copy)\n",
+                cap_done);
     return 0;
+}
+
+/* Synchronous convenience path: export the decoder planes, then run the job
+ * on the calling thread. */
+int v4l2sl_mdp3_detile(struct v4l2sl_context *ctx, int buf_index,
+                       struct v4l2sl_surface *surf)
+{
+    int y_fd, uv_fd, err;
+
+    if (!ctx || !surf || ctx->mdp3.disabled || g_mdp3.fd < 0 ||
+        g_mdp3_owner != ctx || buf_index < 0)
+        return -1;
+
+    y_fd = v4l2sl_capture_expbuf_plane(ctx, buf_index, 0);
+    if (y_fd < 0)
+        return mdp3_fail(ctx, "EXPBUF Y", errno);
+    uv_fd = v4l2sl_capture_expbuf_plane(ctx, buf_index, 1);
+    if (uv_fd < 0) {
+        err = errno;
+        close(y_fd);
+        return mdp3_fail(ctx, "EXPBUF UV", err);
+    }
+    return v4l2sl_mdp3_detile_prepared(ctx, surf, y_fd, uv_fd);
 }
 
 void v4l2sl_mdp3_fini(struct v4l2sl_context *ctx)

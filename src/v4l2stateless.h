@@ -108,6 +108,9 @@ struct v4l2sl_surface {
     uint32_t cpu_stride;
     struct gbm_bo *gbm_bo;   /* driver-owned display copy (linear, R8) */
     uint32_t gbm_stride;
+    uint32_t bo_uv_rows;     /* Y rows before the UV plane inside gbm_bo.
+                              * visible height for the software de-tile, the
+                              * aligned capture height when MDP3 writes it. */
     int expbuf_fd;           /* VIDIOC_EXPBUF of capture, -1 if none (experiment) */
     uint8_t last_writer;     /* v4l2sl_last_writer: who wrote pixels last.
                               * memfd staleness is derived: writer == BO. */
@@ -195,7 +198,6 @@ struct v4l2sl_mdp3 {
     uint32_t cap_height; /* NV12 capture height (aligned) */
     uint32_t cap_width;  /* NV12 capture width */
     uint32_t cap_size;   /* NV12 capture plane size */
-    void *cap_map[V4L2SL_MAX_CAPTURE_BUFS]; /* mmap of CAPTURE plane 0 */
     int fail_count;     /* consecutive HW detile failures */
     int disabled;       /* HW disabled for this session (SW de-tile) */
     int active;         /* init attempted + succeeded for this context */
@@ -455,6 +457,8 @@ int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
 /* Async variant (V4L2SL_DETILE_ASYNC=1): starts the de-tile on a worker
  * thread and returns. v4l2sl_gbm_detile_wait() joins the pending job; call it
  * before freeing/reusing the capture slot or the bo. */
+int v4l2sl_gbm_detile_async_hw(struct v4l2sl_context *ctx,
+                               struct v4l2sl_surface *s, int y_fd, int uv_fd);
 int v4l2sl_gbm_surface_detile_async(struct v4l2sl_surface *s,
                                     const uint8_t *ysrc, const uint8_t *usrc,
                                     uint32_t aw, uint32_t ah);
@@ -505,9 +509,14 @@ void v4l2sl_m2m_teardown(struct v4l2sl_context *ctx, struct v4l2sl_m2m_state *q)
  * -1 (the software de-tile is used instead). detile imports the MM21 capture
  * dma-buf of buf_index, DQBUFs the NV12, and copies it into dst (a linear
  * NV12 buffer at dst_stride). fini tears the queues down. */
+int v4l2sl_mdp3_requested(void);
 int v4l2sl_mdp3_init(struct v4l2sl_context *ctx, int width, int height);
 int v4l2sl_mdp3_detile(struct v4l2sl_context *ctx, int buf_index,
-                       void *dst, uint32_t dst_stride);
+                       struct v4l2sl_surface *surf);
+/* Same job with the decoder planes already exported (takes ownership). */
+int v4l2sl_mdp3_detile_prepared(struct v4l2sl_context *ctx,
+                                struct v4l2sl_surface *surf,
+                                int y_fd, int uv_fd);
 void v4l2sl_mdp3_fini(struct v4l2sl_context *ctx);
 /* One-pass decode-buffer collection shared by every codec translate. */
 void v4l2sl_collect_decode_buffers(struct v4l2sl_buffer **buffers, int n,
