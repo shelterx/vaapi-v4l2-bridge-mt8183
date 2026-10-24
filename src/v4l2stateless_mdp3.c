@@ -88,6 +88,10 @@ static void mdp3_stage_report(void)
 /* Process-wide singleton: the m2m node is single-client. */
 static struct v4l2sl_mdp3 g_mdp3 = { .fd = -1 };
 static struct v4l2sl_context *g_mdp3_owner;
+/* Two decode contexts can pull their first frame concurrently. Without this
+ * lock both would open the single m2m device and reconfigure it under each
+ * other, which corrupts the stream that initialised first. */
+static pthread_mutex_t g_mdp3_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int mdp3_reqbufs(int fd, uint32_t type, int count, uint32_t memory);
 
@@ -129,7 +133,8 @@ static int mdp3_stream(int fd, uint32_t type, int on)
     return ioctl(fd, on ? VIDIOC_STREAMON : VIDIOC_STREAMOFF, &t);
 }
 
-static void mdp3_release(void)
+/* Caller must hold g_mdp3_lock. */
+static void mdp3_release_locked(void)
 {
     if (g_mdp3.fd < 0)
         return;
@@ -181,7 +186,9 @@ static int mdp3_fail(struct v4l2sl_context *ctx, const char *what, int err)
     ctx->mdp3.fail_count = 0;
     ctx->mdp3.active = 0;
     ctx->mdp3.disabled = 1;
-    mdp3_release();
+    pthread_mutex_lock(&g_mdp3_lock);
+    mdp3_release_locked();
+    pthread_mutex_unlock(&g_mdp3_lock);
     return -1;
 }
 
@@ -237,7 +244,7 @@ static int mdp3_reqbufs(int fd, uint32_t type, int count, uint32_t memory)
     return (int)rb.count;
 }
 
-int v4l2sl_mdp3_init(struct v4l2sl_context *ctx, int width, int height)
+static int mdp3_init_locked(struct v4l2sl_context *ctx, int width, int height)
 {
     char path[32] = "?";
     struct v4l2_pix_format_mplane omp, cmp;
@@ -361,7 +368,7 @@ int v4l2sl_mdp3_init(struct v4l2sl_context *ctx, int width, int height)
     return 0;
 
 fail:
-    mdp3_release();
+    mdp3_release_locked();
     ctx->mdp3.active = 0;
     ctx->mdp3.disabled = 1;
     fprintf(stderr, "v4l2stateless: de-tile path = SW (mdp3 init failed)\n");
@@ -512,6 +519,16 @@ int v4l2sl_mdp3_detile_prepared(struct v4l2sl_context *ctx,
 
 /* Synchronous convenience path: export the decoder planes, then run the job
  * on the calling thread. */
+int v4l2sl_mdp3_init(struct v4l2sl_context *ctx, int width, int height)
+{
+    int ret;
+
+    pthread_mutex_lock(&g_mdp3_lock);
+    ret = mdp3_init_locked(ctx, width, height);
+    pthread_mutex_unlock(&g_mdp3_lock);
+    return ret;
+}
+
 int v4l2sl_mdp3_detile(struct v4l2sl_context *ctx, int buf_index,
                        struct v4l2sl_surface *surf)
 {
@@ -535,9 +552,11 @@ int v4l2sl_mdp3_detile(struct v4l2sl_context *ctx, int buf_index,
 
 void v4l2sl_mdp3_fini(struct v4l2sl_context *ctx)
 {
-    if (!ctx || g_mdp3.fd < 0 || g_mdp3_owner != ctx)
-        return;
-    mdp3_release();
-    ctx->mdp3.active = 0;
-    ctx->mdp3.disabled = 1;
+    pthread_mutex_lock(&g_mdp3_lock);
+    if (ctx && g_mdp3.fd >= 0 && g_mdp3_owner == ctx) {
+        mdp3_release_locked();
+        ctx->mdp3.active = 0;
+        ctx->mdp3.disabled = 1;
+    }
+    pthread_mutex_unlock(&g_mdp3_lock);
 }
