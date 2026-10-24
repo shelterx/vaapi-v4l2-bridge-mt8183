@@ -73,6 +73,11 @@ static struct gbm_device *v4l2sl_gbm_device(void)
     return g_gbm_dev;
 }
 
+struct gbm_device *v4l2sl_gbm_device_ref(void)
+{
+    return v4l2sl_gbm_device();
+}
+
 static void copy_plane(uint8_t *dst, uint32_t dst_stride, const uint8_t *src,
                        uint32_t src_stride, uint32_t width, uint32_t rows)
 {
@@ -380,19 +385,26 @@ static void *async_detile_main(void *arg)
 
     clock_gettime(CLOCK_MONOTONIC, &w0);
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c0);
-    if (a->hw)
-        a->ok = v4l2sl_mdp3_detile_prepared(a->ctx, a->surf,
-                                            a->y_fd, a->uv_fd) == 0;
-    else
+    if (a->hw) {
+        /* Both hardware jobs take the decoder planes as dma-bufs and hand
+         * back a complete bo; only the engine differs. */
+        if (v4l2sl_detile_mode() == V4L2SL_DETILE_GPU)
+            a->ok = v4l2sl_gpu_detile(a->surf, a->y_fd, a->uv_fd) == 0;
+        else
+            a->ok = v4l2sl_mdp3_detile_prepared(a->ctx, a->surf,
+                                                a->y_fd, a->uv_fd) == 0;
+    } else {
         a->ok = v4l2sl_gbm_surface_detile_mm21(a->surf, a->ysrc, a->usrc,
                                               a->aw, a->ah) == 0;
+    }
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c1);
     clock_gettime(CLOCK_MONOTONIC, &w1);
     wall = ts_ms(&w0, &w1);
     cpu = ts_ms(&c0, &c1);
     g_last_job_wall_ms = wall;
     g_last_job_cpu_ms = cpu;
-    /* The MDP3 job is expected to take ~10 ms; only flag real outliers. */
+    /* Both hardware jobs are expected to take ~5-10 ms; only flag real
+     * outliers. */
     if (wall > (a->hw ? 20.0 : 8.0) && getenv("V4L2SL_PROFILE"))
         fprintf(stderr,
                 "v4l2stateless: async de-tile slow: hw=%d wall=%.1f cpu=%.1f ms\n",
@@ -544,6 +556,7 @@ void v4l2sl_gbm_surface_destroy(struct v4l2sl_surface *s)
 {
     v4l2sl_gbm_detile_wait();
     if (s && s->gbm_bo) {
+        v4l2sl_gpu_forget_bo(s->gbm_bo);
         gbm_bo_destroy(s->gbm_bo);
         s->gbm_bo = NULL;
     }

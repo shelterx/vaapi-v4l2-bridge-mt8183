@@ -1420,7 +1420,10 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
      * actually needed (hardware disabled, failed, or a non-MM21 format).
      */
     hw_try = (fcc == V4L2_PIX_FMT_MM21) && surf->gbm_bo &&
-             !ctx->mdp3.disabled && v4l2sl_mdp3_requested();
+             !ctx->mdp3.disabled &&
+             (v4l2sl_mdp3_requested() ||
+              (v4l2sl_detile_mode() == V4L2SL_DETILE_GPU &&
+               v4l2sl_gpu_usable()));
     if (!hw_try) {
         if (v4l2sl_mmap_one_capture(ctx, buf_index) < 0)
             return -1;
@@ -1453,14 +1456,50 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
         } while (0)
 
         /*
-         * HW de-tile (MDP3 m2m VPU): export the decoder's MM21 capture planes
-         * as dma-bufs and import them into the m2m OUTPUT queue, so the CPU
-         * never touches the tiled CMA. The m2m's linear NV12 lands in the
-         * surface bo. Lazy-init on the first MM21 frame; any init failure or
-         * 3 consecutive frame failures disable it for the session and the
-         * software de-tile below takes over.
+         * Hardware de-tiles read the capture buffer through dma-bufs, so the
+         * decoder planes are exported here and the worker never issues ioctls
+         * on the decoder fd while the next frame is being decoded.
+         *
+         * GPU: the shader writes the bo and the job waits on the bo's write
+         * fence before anyone can sample it. A failure disables the GPU path
+         * for the session and the software de-tile below rewrites the bo.
          */
-        if (surf->gbm_bo && !ctx->mdp3.disabled) {
+        if (surf->gbm_bo && !ctx->mdp3.disabled &&
+            v4l2sl_detile_mode() == V4L2SL_DETILE_GPU) {
+            /* GPU de-tile: same dma-buf handoff as MDP3, different engine. */
+            int y_fd = v4l2sl_capture_expbuf_plane(ctx, buf_index, 0);
+            int uv_fd = y_fd >= 0
+                            ? v4l2sl_capture_expbuf_plane(ctx, buf_index, 1)
+                            : -1;
+
+            if (uv_fd >= 0) {
+                if (v4l2sl_gbm_detile_async_wanted()) {
+                    if (v4l2sl_gbm_detile_async_hw(ctx, surf, y_fd,
+                                                   uv_fd) == 0) {
+                        g_prof_pending_detile = 0.0;
+                        surf->last_writer = V4L2SL_WRITER_BO;
+                        return 0;
+                    }
+                } else if (v4l2sl_gpu_detile(surf, y_fd, uv_fd) == 0) {
+                    PROF_DETILE_END();
+                    surf->last_writer = V4L2SL_WRITER_BO;
+                    return 0;
+                }
+            }
+            if (y_fd >= 0)
+                close(y_fd);
+            if (uv_fd >= 0)
+                close(uv_fd);
+        }
+        /*
+         * HW de-tile (MDP3 m2m VPU): import the exported planes into the m2m
+         * OUTPUT queue, so the CPU never touches the tiled CMA. The m2m's
+         * linear NV12 lands in the surface bo. Lazy-init on the first MM21
+         * frame; any init failure or 3 consecutive frame failures disable it
+         * for the session and the software de-tile below takes over.
+         */
+        if (surf->gbm_bo && !ctx->mdp3.disabled &&
+            v4l2sl_detile_mode() != V4L2SL_DETILE_GPU) {
             if (!ctx->mdp3.active) {
                 ctx->mdp3.active = 1; /* init attempted */
                 if (v4l2sl_mdp3_init(ctx, (int)stride, (int)alh) < 0)

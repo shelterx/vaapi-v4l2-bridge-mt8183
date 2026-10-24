@@ -450,6 +450,9 @@ VAStatus v4l2sl_surface_fill_prime(const struct v4l2sl_surface *surf,
  * decode surfaces. VPU capture buffers are never exported (chip bug); the
  * bo is panthor system memory kept in sync by pull_capture. */
 int v4l2sl_gbm_surface_ensure(struct v4l2sl_surface *s);
+/* The process-wide gbm device the surface bos are allocated from. Also what
+ * the GPU de-tiler hangs its EGLDisplay on, so the bos are importable. */
+struct gbm_device *v4l2sl_gbm_device_ref(void);
 int v4l2sl_gbm_surface_sync(struct v4l2sl_surface *s);
 int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
                                    const uint8_t *ysrc, const uint8_t *usrc,
@@ -529,6 +532,19 @@ int v4l2sl_mdp3_detile_prepared(struct v4l2sl_context *ctx,
                                 struct v4l2sl_surface *surf,
                                 int y_fd, int uv_fd);
 void v4l2sl_mdp3_fini(struct v4l2sl_context *ctx);
+/* GPU de-tile (v4l2stateless_gpu.c, V4L2SL_DETILE=gpu): a panfrost GLES3
+ * fragment-shader pass that reads the MM21 planes straight from the decoder
+ * dma-bufs and writes linear NV12 into the surface bo. Same contract as the
+ * MDP3 job: takes ownership of the plane fds, returns 0 when the bo is
+ * complete (dma-buf write fence waited for), -1 to let the caller fall back
+ * to the software de-tile for this frame. The first failure disables it for
+ * the session. */
+int v4l2sl_gpu_detile(struct v4l2sl_surface *s, int y_fd, int uv_fd);
+int v4l2sl_gpu_usable(void);
+/* Drop the cached destination image for a bo about to be destroyed; the
+ * cache is keyed by pointer, so a recycled allocation must not inherit it. */
+void v4l2sl_gpu_forget_bo(struct gbm_bo *bo);
+void v4l2sl_gpu_fini(void);
 /* One-pass decode-buffer collection shared by every codec translate. */
 void v4l2sl_collect_decode_buffers(struct v4l2sl_buffer **buffers, int n,
                                    struct v4l2sl_collected *cb);

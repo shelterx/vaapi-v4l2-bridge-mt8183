@@ -16,6 +16,8 @@ libva_dep = dependency('libva', version: '>= 1.20.0')
 libva_drm_dep = dependency('libva-drm', version: '>= 1.20.0')
 libdrm_dep = dependency('libdrm', version: '>= 2.4.0')
 gbm_dep = dependency('gbm')
+egl_dep = dependency('egl')
+glesv2_dep = dependency('glesv2')
 
 # Get the driver install directory from libva
 libva_driverdir = libva_dep.get_variable(pkgconfig: 'driverdir')
@@ -45,6 +47,7 @@ core_sources = files(
   'src/v4l2stateless_jpeg.c',
   'src/v4l2stateless_vpp.c',
   'src/v4l2stateless_mdp3.c',
+  'src/v4l2stateless_gpu.c',
 )
 
 # One source of truth: every driver source lives in this static library; the
@@ -53,7 +56,8 @@ core_sources = files(
 # translators) from the .so.
 libv4l2sl_core = static_library('v4l2sl_core', core_sources,
   include_directories: inc,
-  dependencies: [libva_dep, libva_drm_dep, libdrm_dep, gbm_dep],
+  dependencies: [libva_dep, libva_drm_dep, libdrm_dep, gbm_dep,
+                 egl_dep, glesv2_dep],
 )
 
 shared_library('v4l2stateless_drv_video',
