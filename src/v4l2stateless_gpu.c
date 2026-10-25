@@ -125,6 +125,64 @@ static pthread_mutex_t g_gpu_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Set once any job fails; the session stays on the software de-tile. */
 static int g_gpu_failed;
 
+/* Which surface's job is still reading each decoder capture slot. The GPU
+ * keeps reading the source planes after the worker returns, so the slot must
+ * not be handed back to the decoder until that job's fence has fired (the
+ * write fence doubles as "sources fully read"). */
+static struct v4l2sl_surface *g_src_owner[V4L2SL_MAX_CAPTURE_BUFS];
+
+/* Surfaces holding an unreaped write fence. Teardown (capture renegotiation,
+ * context destroy) must reap them all before the decoder's buffers go away;
+ * a bounded table is enough because only one job runs at a time. */
+#define GPU_FENCED_MAX 32
+static struct v4l2sl_surface *g_fenced[GPU_FENCED_MAX];
+
+/* Take the pending fence away from a surface so exactly one owner can close
+ * it. Caller holds g_gpu_lock; this is the only place the field is cleared,
+ * which is what makes the close safe against the pull thread racing the GL
+ * thread (a double close could land on a recycled fd that Chromium owns). */
+static int gpu_take_fence_locked(struct v4l2sl_surface *s)
+{
+    int fd = s->gpu_fence_fd;
+
+    s->gpu_fence_fd = -1;
+    for (int i = 0; i < GPU_FENCED_MAX; i++)
+        if (g_fenced[i] == s)
+            g_fenced[i] = NULL;
+    /* fd 0-2 means a zeroed/partial surface struct: never close those. */
+    return fd > 2 ? fd : -1;
+}
+
+static void gpu_track_fenced_locked(struct v4l2sl_surface *s)
+{
+    for (int i = 0; i < GPU_FENCED_MAX; i++) {
+        if (g_fenced[i] == s)
+            return;
+    }
+    for (int i = 0; i < GPU_FENCED_MAX; i++) {
+        if (!g_fenced[i]) {
+            g_fenced[i] = s;
+            return;
+        }
+    }
+}
+
+static void gpu_poll_close(int fd, const char *what)
+{
+    struct pollfd pf;
+    int r;
+
+    pf.fd = fd;
+    pf.events = POLLIN;
+    do {
+        r = poll(&pf, 1, 1000);
+    } while (r < 0 && errno == EINTR);
+    if (r <= 0)
+        fprintf(stderr, "v4l2stateless: gpu: %s fence %s\n", what,
+                r == 0 ? "timed out" : "poll failed");
+    close(fd);
+}
+
 static double gpu_now_ms(void)
 {
     struct timespec ts;
@@ -373,17 +431,29 @@ static GLuint gpu_dst_fbo(struct v4l2sl_surface *s, int bo_fd)
     return e->fbo;
 }
 
-/* Wait for the GPU to stop writing the bo. Returns 0 when the bo is complete. */
-static int gpu_wait_write_fence(int bo_fd, double *wait_ms)
+/*
+ * Publish the fence instead of waiting for it.
+ *
+ * The de-tile job and every GPU consumer of the bo are serialised by the GPU
+ * itself: we submit first, so a compositor sampling the bo afterwards runs
+ * after us and reads complete pixels. Waiting here only stalls the worker.
+ *
+ * The fence is still exported and attached to the bo's reservation object so
+ * kernel-mediated users (CPU readback via dma_buf_begin_cpu_access, KMS) wait
+ * properly, and a copy of it is kept on the surface for the CPU paths that
+ * panfrost does not order for us (gbm_bo_map does not wait).
+ *
+ * Measured on the cross-screen probe: panfrost's *sampler* ignores this
+ * fence, so it must never be the only thing between a half-written bo and a
+ * consumer. GPU queue order is what makes this safe.
+ */
+static int gpu_publish_write_fence(struct v4l2sl_surface *s, int bo_fd,
+                                   double *wait_ms)
 {
     struct dma_buf_export_sync_file ex = {
         .flags = DMA_BUF_SYNC_WRITE,
         .fd = -1,
     };
-    struct pollfd pf;
-    double t0;
-    int r;
-
     if (ioctl(bo_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &ex) < 0 || ex.fd < 0) {
         fprintf(stderr, "v4l2stateless: gpu: no write fence on the bo: %s\n",
                 strerror(errno));
@@ -391,20 +461,119 @@ static int gpu_wait_write_fence(int bo_fd, double *wait_ms)
             close(ex.fd);
         return -1;
     }
-    pf.fd = ex.fd;
-    pf.events = POLLIN;
-    t0 = gpu_now_ms();
-    do {
-        r = poll(&pf, 1, 1000);
-    } while (r < 0 && errno == EINTR);
-    *wait_ms = gpu_now_ms() - t0;
-    close(ex.fd);
-    if (r <= 0) {
-        fprintf(stderr, "v4l2stateless: gpu: frame fence %s after %.1f ms\n",
-                r == 0 ? "timed out" : "failed", *wait_ms);
-        return -1;
+    {
+        struct dma_buf_import_sync_file im = {
+            .flags = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE,
+            .fd = ex.fd,
+        };
+
+        /* Best effort: an importer that ignores reservation fences is already
+         * covered by GPU ordering. */
+        if (ioctl(bo_fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &im) < 0 &&
+            getenv("V4L2SL_PROFILE"))
+            fprintf(stderr, "v4l2stateless: gpu: fence attach failed: %s\n",
+                    strerror(errno));
     }
+    /* The previous fence for this surface was already reaped by the pull
+     * thread or is being replaced here; steal it so only one of them closes. */
+    {
+        int old = gpu_take_fence_locked(s);
+
+        if (old >= 0)
+            close(old);
+    }
+    s->gpu_fence_fd = ex.fd;
+    gpu_track_fenced_locked(s);
+    *wait_ms = 0.0;
     return 0;
+}
+
+/* Block until the GPU has finished writing this surface's bo. Only for CPU
+ * access to the pixels (readback/memfd refill/destroy), never for the
+ * per-frame handoff. */
+/* Note that a job for `s` is reading capture slot `idx`. */
+static void gpu_note_source(struct v4l2sl_surface *s)
+{
+    if (s->buf_index >= 0 && s->buf_index < V4L2SL_MAX_CAPTURE_BUFS)
+        g_src_owner[s->buf_index] = s;
+}
+
+/* Called before a capture slot goes back to the decoder: if a GPU job is
+ * still reading it, wait for that job. Cheap when the job already finished
+ * (poll on a signalled fence). */
+void v4l2sl_gpu_wait_capture(int buf_index)
+{
+    struct v4l2sl_surface *s;
+
+    if (buf_index < 0 || buf_index >= V4L2SL_MAX_CAPTURE_BUFS)
+        return;
+    pthread_mutex_lock(&g_gpu_lock);
+    s = g_src_owner[buf_index];
+    g_src_owner[buf_index] = NULL;
+    pthread_mutex_unlock(&g_gpu_lock);
+    if (s)
+        v4l2sl_gpu_wait_surface(s);
+}
+
+void v4l2sl_gpu_wait_surface(struct v4l2sl_surface *s)
+{
+    int fd;
+
+    if (!s)
+        return;
+    pthread_mutex_lock(&g_gpu_lock);
+    fd = gpu_take_fence_locked(s);
+    pthread_mutex_unlock(&g_gpu_lock);
+    if (fd >= 0)
+        gpu_poll_close(fd, "bo");
+}
+
+/* Reap every outstanding write fence. Called when the decoder's buffers are
+ * about to be freed or renegotiated: the GPU may still be reading them. */
+void v4l2sl_gpu_wait_pending(void)
+{
+    struct v4l2sl_surface *pending[GPU_FENCED_MAX];
+    int n = 0;
+
+    pthread_mutex_lock(&g_gpu_lock);
+    for (int i = 0; i < GPU_FENCED_MAX; i++) {
+        pending[i] = g_fenced[i];
+        g_fenced[i] = NULL;
+    }
+    pthread_mutex_unlock(&g_gpu_lock);
+    for (int i = 0; i < GPU_FENCED_MAX; i++)
+        if (pending[i])
+            n++;
+    if (!n)
+        return;
+    for (int i = 0; i < GPU_FENCED_MAX; i++)
+        if (pending[i]) {
+            int fd;
+
+            pthread_mutex_lock(&g_gpu_lock);
+            fd = gpu_take_fence_locked(pending[i]);
+            pthread_mutex_unlock(&g_gpu_lock);
+            if (fd >= 0)
+                gpu_poll_close(fd, "teardown");
+        }
+}
+
+/* A surface is going away: drop everything that points at it, so a recycled
+ * struct or a stale capture-slot entry can never close an unrelated fd. */
+void v4l2sl_gpu_forget_surface(struct v4l2sl_surface *s)
+{
+    int fd;
+
+    if (!s)
+        return;
+    pthread_mutex_lock(&g_gpu_lock);
+    fd = gpu_take_fence_locked(s);
+    for (int i = 0; i < V4L2SL_MAX_CAPTURE_BUFS; i++)
+        if (g_src_owner[i] == s)
+            g_src_owner[i] = NULL;
+    pthread_mutex_unlock(&g_gpu_lock);
+    if (fd >= 0)
+        gpu_poll_close(fd, "surface destroy");
 }
 
 int v4l2sl_gpu_usable(void)
@@ -494,6 +663,10 @@ int v4l2sl_gpu_detile(struct v4l2sl_surface *s, int y_fd, int uv_fd)
     pthread_mutex_unlock(&g_req.lock);
     close(y_fd);
     close(uv_fd);
+    /* A/B escape hatch: block here (not in the GL thread, which holds the
+     * lock) to reproduce the pre-pipelined handoff. */
+    if (getenv("V4L2SL_GPU_WAIT"))
+        v4l2sl_gpu_wait_surface(s);
     return rc;
 fail:
     if (y_fd >= 0)
@@ -568,6 +741,7 @@ static int gpu_job(struct v4l2sl_surface *s, int y_fd, int uv_fd)
     bo_fd = gbm_bo_get_fd(s->gbm_bo);
     if (!ty || !tu || bo_fd < 0)
         goto release;
+    gpu_note_source(s);
     fbo = gpu_dst_fbo(s, bo_fd);
     if (!fbo)
         goto release;
@@ -591,7 +765,7 @@ static int gpu_job(struct v4l2sl_surface *s, int y_fd, int uv_fd)
         fprintf(stderr, "v4l2stateless: gpu: GL error during the draw\n");
         goto release;
     }
-    if (gpu_wait_write_fence(bo_fd, &wait_ms) < 0)
+    if (gpu_publish_write_fence(s, bo_fd, &wait_ms) < 0)
         goto release;
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     rc = 0;

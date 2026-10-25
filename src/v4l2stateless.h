@@ -112,6 +112,10 @@ struct v4l2sl_surface {
                               * visible height for the software de-tile, the
                               * aligned capture height when MDP3 writes it. */
     int expbuf_fd;           /* VIDIOC_EXPBUF of capture, -1 if none (experiment) */
+    int gpu_fence_fd;        /* pending GPU write fence for gbm_bo (GPU de-tile),
+                              * -1 when the bo is idle. Only the CPU-readback
+                              * paths wait on it: GPU consumers are ordered
+                              * after the de-tile by the GPU queue itself. */
     uint8_t last_writer;     /* v4l2sl_last_writer: who wrote pixels last.
                               * memfd staleness is derived: writer == BO. */
 };
@@ -538,9 +542,21 @@ void v4l2sl_mdp3_fini(struct v4l2sl_context *ctx);
  * MDP3 job: takes ownership of the plane fds, returns 0 when the bo is
  * complete (dma-buf write fence waited for), -1 to let the caller fall back
  * to the software de-tile for this frame. The first failure disables it for
- * the session. */
+ * the session. ALWAYS takes ownership of both fds, success or failure. */
 int v4l2sl_gpu_detile(struct v4l2sl_surface *s, int y_fd, int uv_fd);
 int v4l2sl_gpu_usable(void);
+/* Wait for an outstanding GPU write to this surface's bo. Needed only before
+ * the CPU touches the pixels (memfd refill, destroy); the display handoff is
+ * ordered by the GPU queue and must not block. */
+void v4l2sl_gpu_wait_surface(struct v4l2sl_surface *s);
+/* Same, for a decoder capture slot about to be re-queued: the GPU job keeps
+ * reading the plane dma-bufs after the worker returns. */
+void v4l2sl_gpu_wait_capture(int buf_index);
+/* Reap every outstanding GPU write fence; call before the decoder's capture
+ * buffers are freed or renegotiated (they may still be read by the GPU). */
+void v4l2sl_gpu_wait_pending(void);
+/* Drop all GPU state pointing at a surface that is being destroyed. */
+void v4l2sl_gpu_forget_surface(struct v4l2sl_surface *s);
 /* Drop the cached destination image for a bo about to be destroyed; the
  * cache is keyed by pointer, so a recycled allocation must not inherit it. */
 void v4l2sl_gpu_forget_bo(struct gbm_bo *bo);

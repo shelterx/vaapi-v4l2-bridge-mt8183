@@ -347,6 +347,7 @@ void v4l2sl_release_context_device(struct v4l2sl_context *ctx)
         return;
 
     v4l2sl_gbm_detile_wait();
+    v4l2sl_gpu_wait_pending();
 
     /* Persistent M2M queues hold V4L2 MMAP mappings — release them while
      * the device fd is still open. */
@@ -447,6 +448,7 @@ static void rebuild_free_pools(struct v4l2sl_context *ctx)
 void v4l2sl_decode_reset(struct v4l2sl_context *ctx)
 {
     v4l2sl_gbm_detile_wait();   /* capture slots are about to be recycled */
+    v4l2sl_gpu_wait_pending();  /* ... and the GPU may still be reading them */
     if (!ctx || ctx->v4l2_fd < 0)
         return;
 
@@ -480,6 +482,9 @@ void v4l2sl_decode_reset(struct v4l2sl_context *ctx)
  */
 static struct {
     int enabled, window, n, slow;
+    /* Separate from `enabled`: V4L2SL_TRACE only wants the CSV, not a
+     * summary line on the driver's stderr every window frames. */
+    int report;
     double dec_sum, dec_max;
     double pull_sum, pull_max;
     double det_sum, det_max;
@@ -518,6 +523,7 @@ static void prof_init(void)
         }
     }
     g_prof.enabled = 1;
+    g_prof.report = prof_on;
     if (prof_on)
         fprintf(stderr, "v4l2stateless: profile on, window=%d frames\n",
                 g_prof.window);
@@ -527,7 +533,7 @@ static void prof_init(void)
 
 static void prof_report(void)
 {
-    if (g_prof.n < g_prof.window)
+    if (!g_prof.report || g_prof.n < g_prof.window)
         return;
     fprintf(stderr,
             "v4l2stateless: profile n=%d decode avg=%.1f max=%.1f | "
@@ -876,6 +882,7 @@ int v4l2sl_ensure_capture(struct v4l2sl_context *ctx, int width, int height,
     }
 
     v4l2sl_gbm_detile_wait();   /* pending de-tile reads a capture slot */
+    v4l2sl_gpu_wait_pending();  /* ... and the GPU may still read it */
     release_ctx_capture_surfaces(ctx);
     v4l2sl_unmap_capture_buffers(ctx);
 
@@ -1261,6 +1268,11 @@ int v4l2sl_queue_capture(int fd, int buf_index, int request_fd)
      * request on the OUTPUT side completes. */
     (void)request_fd;
 
+    /* The GPU de-tile reads this capture slot through dma-bufs after the
+     * worker thread has returned; the decoder must not refill it yet. */
+    if (v4l2sl_detile_mode() == V4L2SL_DETILE_GPU)
+        v4l2sl_gpu_wait_capture(buf_index);
+
     if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
         fprintf(stderr, "v4l2stateless: QBUF capture[%d] failed: %s\n", buf_index, strerror(errno));
         return -1;
@@ -1480,10 +1492,21 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
                         surf->last_writer = V4L2SL_WRITER_BO;
                         return 0;
                     }
-                } else if (v4l2sl_gpu_detile(surf, y_fd, uv_fd) == 0) {
-                    PROF_DETILE_END();
-                    surf->last_writer = V4L2SL_WRITER_BO;
-                    return 0;
+                } else {
+                    /* The job consumes both fds even when it fails (bad
+                     * geometry after a quality change, fence error, ...), so
+                     * they must not be closed again below: a second close
+                     * lands on a recycled fd, and inside Chromium that fd is
+                     * often one it owns. */
+                    int rc = v4l2sl_gpu_detile(surf, y_fd, uv_fd);
+
+                    y_fd = -1;
+                    uv_fd = -1;
+                    if (rc == 0) {
+                        PROF_DETILE_END();
+                        surf->last_writer = V4L2SL_WRITER_BO;
+                        return 0;
+                    }
                 }
             }
             if (y_fd >= 0)

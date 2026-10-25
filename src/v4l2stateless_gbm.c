@@ -131,6 +131,7 @@ int v4l2sl_surface_ensure_memfd(struct v4l2sl_surface *s)
     if (!s || !v4l2sl_memfd_stale(s) || !s->gbm_bo)
         return 0;
     v4l2sl_gbm_detile_wait();   /* bo may still be written by a pending job */
+    v4l2sl_gpu_wait_surface(s); /* ... and the GPU may still be rendering it */
     if (s->memfd_fd < 0 || !s->stride || !s->aligned_h)
         return -1;
     w = s->width;
@@ -529,6 +530,9 @@ int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
                                    const uint8_t *ysrc, const uint8_t *usrc,
                                    uint32_t aw, uint32_t ah)
 {
+    /* A failed GPU job may still be writing this bo; the software fallback
+     * rewrites it, so the two must not overlap. */
+    v4l2sl_gpu_wait_surface(s);
     uint32_t w = s->width, h = s->height;
     void *map_data = NULL;
     uint32_t mstride = 0;
@@ -555,6 +559,9 @@ int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
 void v4l2sl_gbm_surface_destroy(struct v4l2sl_surface *s)
 {
     v4l2sl_gbm_detile_wait();
+    /* The bo is about to be freed; the GPU may still be rendering into it. */
+    v4l2sl_gpu_wait_surface(s);
+    v4l2sl_gpu_forget_surface(s);
     if (s && s->gbm_bo) {
         v4l2sl_gpu_forget_bo(s->gbm_bo);
         gbm_bo_destroy(s->gbm_bo);

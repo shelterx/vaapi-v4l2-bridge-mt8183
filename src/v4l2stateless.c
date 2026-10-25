@@ -650,6 +650,7 @@ v4l2sl_create_surfaces(VADriverContextP ctx,
         surface->cap_view = NULL;
         surface->memfd_fd = -1;
         surface->expbuf_fd = -1;
+        surface->gpu_fence_fd = -1;
         surface->cpu_stride = v4l2sl_default_image_stride(format, width);
         surface->cpu_size = v4l2sl_va_image_size(format, surface->cpu_stride, height);
         /* cpu_ptr is lazy (ensure_cpu): decode-only surfaces never touch
@@ -1630,6 +1631,7 @@ v4l2sl_sync_surface(VADriverContextP ctx, VASurfaceID render_target)
     struct v4l2sl_surface *surface;
 
     v4l2sl_gbm_detile_wait();
+    v4l2sl_gpu_wait_pending();  /* a sync request means "the frame is done" */
     pthread_mutex_lock(&g_v4l2sl_lock);
     surface = v4l2sl_surface_by_id(driver_data, render_target);
     if (!surface) {
