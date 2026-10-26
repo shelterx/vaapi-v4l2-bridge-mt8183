@@ -394,6 +394,26 @@ static int gpu_init_locked(void)
     return 0;
 }
 
+/* The GL thread only: delete the objects of tombstoned entries. The context
+ * is current here, so these deletions actually happen. Caller holds
+ * g_gpu_lock (gpu_job() holds it for the whole job). */
+static void gpu_sweep_dead_locked(void)
+{
+    for (int i = 0; i < DST_ENTRIES; i++) {
+        struct dst_entry *e = &g_gpu.dst[i];
+
+        if (e->bo || (!e->fbo && !e->tex && e->img == EGL_NO_IMAGE_KHR))
+            continue;
+        if (e->fbo)
+            glDeleteFramebuffers(1, &e->fbo);
+        if (e->tex)
+            glDeleteTextures(1, &e->tex);
+        if (e->img != EGL_NO_IMAGE_KHR && g_gpu.dpy != EGL_NO_DISPLAY)
+            g_destroy_image(g_gpu.dpy, e->img);
+        memset(e, 0, sizeof(*e));
+    }
+}
+
 /* Caller holds g_gpu_lock. Returns the FBO for this bo, importing it once. */
 static GLuint gpu_dst_fbo(struct v4l2sl_surface *s, int bo_fd)
 {
@@ -742,6 +762,9 @@ static int gpu_job(struct v4l2sl_surface *s, int y_fd, int uv_fd)
         goto unlock;
     t_makecur = gpu_now_ms() - t0;
 
+    /* Delete the objects of surfaces destroyed since the last job; this is the
+     * only thread where the context is current. */
+    gpu_sweep_dead_locked();
     /* A stale error from an earlier job must not be read as this draw's. */
     while (glGetError() != GL_NO_ERROR)
         ;
@@ -833,20 +856,14 @@ void v4l2sl_gpu_forget_bo(struct gbm_bo *bo)
 
         if (e->bo != bo)
             continue;
-        /* The bo is going away; the image and FBO must not outlive it. */
-        if (g_gpu.dpy != EGL_NO_DISPLAY) {
-            eglMakeCurrent(g_gpu.dpy, g_gpu.surf, g_gpu.surf, g_gpu.ctx);
-            if (e->fbo)
-                glDeleteFramebuffers(1, &e->fbo);
-            if (e->tex)
-                glDeleteTextures(1, &e->tex);
-            if (e->img != EGL_NO_IMAGE_KHR)
-                g_destroy_image(g_gpu.dpy, e->img);
-            eglMakeCurrent(g_gpu.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                           EGL_NO_CONTEXT);
-            eglReleaseThread();
-        }
-        memset(e, 0, sizeof(*e));
+        /* Tombstone: clear the key so a recycled allocation cannot match this
+         * entry, but keep the GL names. Deleting them here cannot work - the
+         * context belongs to the GL thread, and eglMakeCurrent() from another
+         * thread fails with EGL_BAD_ACCESS, after which glDelete* is a silent
+         * no-op (and the memset below would drop the names for good, leaking
+         * the FBO, the texture and - through it - the bo's memory).
+         * gpu_sweep_dead_locked() deletes them on the GL thread instead. */
+        e->bo = NULL;
     }
     pthread_mutex_unlock(&g_gpu_lock);
 }
@@ -877,6 +894,9 @@ void v4l2sl_gpu_fini(void)
         memset(e, 0, sizeof(*e));
     }
     if (g_gpu.state > 0 && g_gpu.dpy != EGL_NO_DISPLAY) {
+        /* The GL thread has been joined, but if the context is still current
+         * somewhere eglMakeCurrent() fails with EGL_BAD_ACCESS and the
+         * deletes below would be no-ops. Nothing better is possible here. */
         eglMakeCurrent(g_gpu.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
                        EGL_NO_CONTEXT);
         if (g_gpu.vao)
