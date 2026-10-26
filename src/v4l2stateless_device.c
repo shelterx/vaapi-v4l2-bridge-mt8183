@@ -348,6 +348,7 @@ void v4l2sl_release_context_device(struct v4l2sl_context *ctx)
 
     v4l2sl_gbm_detile_wait();
     v4l2sl_gpu_wait_pending();
+    v4l2sl_gpu_forget_capture(ctx);
 
     /* Persistent M2M queues hold V4L2 MMAP mappings — release them while
      * the device fd is still open. */
@@ -883,6 +884,7 @@ int v4l2sl_ensure_capture(struct v4l2sl_context *ctx, int width, int height,
 
     v4l2sl_gbm_detile_wait();   /* pending de-tile reads a capture slot */
     v4l2sl_gpu_wait_pending();  /* ... and the GPU may still read it */
+    v4l2sl_gpu_forget_capture(ctx);  /* the pool's dma-bufs die below */
     release_ctx_capture_surfaces(ctx);
     v4l2sl_unmap_capture_buffers(ctx);
 

@@ -561,6 +561,10 @@ void v4l2sl_gpu_forget_surface(struct v4l2sl_surface *s);
 /* Drop the cached destination image for a bo about to be destroyed; the
  * cache is keyed by pointer, so a recycled allocation must not inherit it. */
 void v4l2sl_gpu_forget_bo(struct gbm_bo *bo);
+/* Drop the cached source plane images of a context whose capture pool is
+ * being freed (context release, capture renegotiation). A decode reset keeps
+ * the pool and must not call this. */
+void v4l2sl_gpu_forget_capture(struct v4l2sl_context *ctx);
 void v4l2sl_gpu_fini(void);
 /* One-pass decode-buffer collection shared by every codec translate. */
 void v4l2sl_collect_decode_buffers(struct v4l2sl_buffer **buffers, int n,

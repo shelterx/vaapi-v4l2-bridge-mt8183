@@ -108,6 +108,22 @@ struct dst_entry {
 };
 #define DST_ENTRIES 16
 
+/* Source plane images are per capture slot: the pool's dma-bufs are stable
+ * for the pool's lifetime, and a per-frame EXPBUF just hands out a fresh fd
+ * number for the same dma-buf, so the fd cannot be the key. Keyed by
+ * (ctx, buf_index, plane); the pool only dies on context release or capture
+ * renegotiation, where v4l2sl_gpu_forget_capture() tombstones the entries.
+ * A decode reset keeps the pool, so cached images stay valid across it. */
+struct src_entry {
+    struct v4l2sl_context *ctx;
+    int buf_index;
+    int plane;
+    uint32_t tiles;
+    EGLImageKHR img;
+    GLuint tex;
+};
+#define SRC_ENTRIES 80
+
 static struct {
     EGLDisplay dpy;
     EGLContext ctx;
@@ -119,6 +135,8 @@ static struct {
     int state;              /* 0 = uninit, 1 = ready, -1 = failed */
     struct dst_entry dst[DST_ENTRIES];
     int dst_next;
+    struct src_entry src[SRC_ENTRIES];
+    int src_next;
 } g_gpu;
 
 static pthread_mutex_t g_gpu_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -413,6 +431,19 @@ static void gpu_sweep_dead_locked(void)
             g_destroy_image(g_gpu.dpy, e->img);
         memset(e, 0, sizeof(*e));
     }
+    for (int i = 0; i < SRC_ENTRIES; i++) {
+        struct src_entry *e = &g_gpu.src[i];
+
+        if (e->ctx || (!e->tex && e->img == EGL_NO_IMAGE_KHR))
+            continue;
+        if (e->tex)
+            glDeleteTextures(1, &e->tex);
+        if (e->img != EGL_NO_IMAGE_KHR && g_gpu.dpy != EGL_NO_DISPLAY)
+            g_destroy_image(g_gpu.dpy, e->img);
+        memset(e, 0, sizeof(*e));
+        e->buf_index = -1;
+        e->plane = -1;
+    }
 }
 
 /* Caller holds g_gpu_lock. Returns the FBO for this bo, importing it once. */
@@ -463,6 +494,59 @@ static GLuint gpu_dst_fbo(struct v4l2sl_surface *s, int bo_fd)
         glBindFramebuffer(GL_FRAMEBUFFER, e->fbo);
     }
     return e->fbo;
+}
+
+/* Caller holds g_gpu_lock (GL thread, context current). Returns the cached
+ * texture for this capture plane, importing the dma-buf once per slot. */
+static GLuint gpu_src_texture(struct v4l2sl_context *ctx, int buf_index,
+                              int plane, int fd, uint32_t width,
+                              uint32_t tiles)
+{
+    struct src_entry *e = NULL;
+
+    if (!ctx || buf_index < 0 || fd < 0)
+        return 0;
+    for (int i = 0; i < SRC_ENTRIES; i++) {
+        struct src_entry *c = &g_gpu.src[i];
+
+        if (c->ctx == ctx && c->buf_index == buf_index &&
+            c->plane == plane && c->tiles == tiles) {
+            e = c;
+            break;
+        }
+    }
+    if (!e) {
+        /* Reuse the next slot; we are on the GL thread with the context
+         * current, so its old objects can be deleted immediately. */
+        e = &g_gpu.src[g_gpu.src_next];
+        g_gpu.src_next = (g_gpu.src_next + 1) % SRC_ENTRIES;
+        if (e->tex)
+            glDeleteTextures(1, &e->tex);
+        if (e->img != EGL_NO_IMAGE_KHR)
+            g_destroy_image(g_gpu.dpy, e->img);
+        memset(e, 0, sizeof(*e));
+        e->ctx = ctx;
+        e->buf_index = buf_index;
+        e->plane = plane;
+        e->tiles = tiles;
+        e->img = gpu_image_r8(fd, width, tiles, width);
+        if (e->img == EGL_NO_IMAGE_KHR) {
+            e->ctx = NULL;
+            e->buf_index = -1;
+            e->plane = -1;
+            return 0;
+        }
+        e->tex = gpu_texture(e->img);
+        if (!e->tex) {
+            g_destroy_image(g_gpu.dpy, e->img);
+            e->img = EGL_NO_IMAGE_KHR;
+            e->ctx = NULL;
+            e->buf_index = -1;
+            e->plane = -1;
+            return 0;
+        }
+    }
+    return e->tex;
 }
 
 /*
@@ -730,7 +814,6 @@ static int gpu_job(struct v4l2sl_surface *s, int y_fd, int uv_fd)
     t0c = ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
 
     uint32_t cap_stride, ah, tiles, aw;
-    EGLImageKHR iy = EGL_NO_IMAGE_KHR, iu = EGL_NO_IMAGE_KHR;
     GLuint ty = 0, tu = 0, fbo;
     int bo_fd = -1, rc = -1, attempted = 0;
     double wait_ms = 0.0;
@@ -770,18 +853,16 @@ static int gpu_job(struct v4l2sl_surface *s, int y_fd, int uv_fd)
     while (glGetError() != GL_NO_ERROR)
         ;
     t0 = gpu_now_ms();
-    iy = gpu_image_r8(y_fd, 512, tiles, 512);
-    iu = gpu_image_r8(uv_fd, 256, tiles, 256);
+    ty = gpu_src_texture(s->capture_owner, s->buf_index, 0, y_fd, 512, tiles);
+    tu = gpu_src_texture(s->capture_owner, s->buf_index, 1, uv_fd, 256, tiles);
     t_import = gpu_now_ms() - t0;
-    if (iy == EGL_NO_IMAGE_KHR || iu == EGL_NO_IMAGE_KHR) {
-        fprintf(stderr, "v4l2stateless: gpu: plane import failed (y=%p/%d "
-                        "u=%p/%d err=0x%x tid=%lu)\n",
-                (void *)iy, y_fd, (void *)iu, uv_fd, eglGetError(),
+    if (!ty || !tu) {
+        fprintf(stderr, "v4l2stateless: gpu: plane import failed (y=%d "
+                        "u=%d err=0x%x tid=%lu)\n",
+                y_fd, uv_fd, eglGetError(),
                 (unsigned long)pthread_self());
         goto release;
     }
-    ty = gpu_texture(iy);
-    tu = gpu_texture(iu);
     bo_fd = gbm_bo_get_fd(s->gbm_bo);
     if (!ty || !tu || bo_fd < 0)
         goto release;
@@ -814,14 +895,7 @@ static int gpu_job(struct v4l2sl_surface *s, int y_fd, int uv_fd)
     rc = 0;
 
 release:
-    if (ty)
-        glDeleteTextures(1, &ty);
-    if (tu)
-        glDeleteTextures(1, &tu);
-    if (iy != EGL_NO_IMAGE_KHR)
-        g_destroy_image(g_gpu.dpy, iy);
-    if (iu != EGL_NO_IMAGE_KHR)
-        g_destroy_image(g_gpu.dpy, iu);
+    /* ty/tu are cached per capture slot and live on past this job. */
     glBindTexture(GL_TEXTURE_2D, 0);
     glUseProgram(0);
 unlock:
@@ -869,6 +943,24 @@ void v4l2sl_gpu_forget_bo(struct gbm_bo *bo)
     pthread_mutex_unlock(&g_gpu_lock);
 }
 
+/* The capture pool's dma-bufs are going away (context release, capture
+ * renegotiation): tombstone this context's cached source images so the GL
+ * thread can delete them. A decode reset keeps the pool, so it must not
+ * call this. */
+void v4l2sl_gpu_forget_capture(struct v4l2sl_context *ctx)
+{
+    if (!ctx)
+        return;
+    pthread_mutex_lock(&g_gpu_lock);
+    for (int i = 0; i < SRC_ENTRIES; i++) {
+        struct src_entry *e = &g_gpu.src[i];
+
+        if (e->ctx == ctx)
+            e->ctx = NULL;
+    }
+    pthread_mutex_unlock(&g_gpu_lock);
+}
+
 void v4l2sl_gpu_fini(void)
 {
     pthread_mutex_lock(&g_req.lock);
@@ -888,6 +980,15 @@ void v4l2sl_gpu_fini(void)
 
         if (e->fbo)
             glDeleteFramebuffers(1, &e->fbo);
+        if (e->tex)
+            glDeleteTextures(1, &e->tex);
+        if (e->img != EGL_NO_IMAGE_KHR && g_gpu.dpy != EGL_NO_DISPLAY)
+            g_destroy_image(g_gpu.dpy, e->img);
+        memset(e, 0, sizeof(*e));
+    }
+    for (int i = 0; i < SRC_ENTRIES; i++) {
+        struct src_entry *e = &g_gpu.src[i];
+
         if (e->tex)
             glDeleteTextures(1, &e->tex);
         if (e->img != EGL_NO_IMAGE_KHR && g_gpu.dpy != EGL_NO_DISPLAY)
