@@ -72,13 +72,14 @@ static const char *VS =
     "}\n";
 
 /* Luma for the top aligned_h rows, interleaved chroma below. Verified
- * byte-exact against v4l2sl_mm21_detile(); do not "simplify" the tile math:
- * the chroma tile is 8x16 samples (256 B), i.e. 8 sample pairs per row, and
- * (x & 1) picks U or V out of the interleaved pair. */
+ * byte-exact against v4l2sl_mm21_detile(). The UV index math was simplified
+ * 2026-10-26 ((x/2)/8 == x/16 and ((x/2)%8)*2 + (x&1) == x%16 for x >= 0),
+ * re-verified byte-exact with no measurable timing change. The chroma tile
+ * is 8x16 samples (256 B), i.e. 8 sample pairs per row. */
 static const char *FS =
     "#version 300 es\n"
     "precision highp float; precision highp int;\n"
-    "uniform sampler2D u_y, u_uv; uniform int u_tc, u_ah; out vec4 o;\n"
+    "uniform sampler2D u_y, u_uv; uniform int u_tc, u_ah; out float o;\n"
     "void main(){\n"
     "  int x = int(gl_FragCoord.x), y = int(gl_FragCoord.y), t, of; float v;\n"
     "  if (y < u_ah) {\n"
@@ -86,12 +87,12 @@ static const char *FS =
     "    of = (y % 32) * 16 + (x % 16);\n"
     "    v = texelFetch(u_y, ivec2(of, t), 0).r;\n"
     "  } else {\n"
-    "    int cy = y - u_ah, cx = x / 2;\n"
-    "    t = (cy / 16) * u_tc + (cx / 8);\n"
-    "    of = (cy % 16) * 16 + (cx % 8) * 2 + (x & 1);\n"
+    "    int cy = y - u_ah;\n"
+    "    t = (cy / 16) * u_tc + (x / 16);\n"
+    "    of = (cy % 16) * 16 + (x % 16);\n"
     "    v = texelFetch(u_uv, ivec2(of, t), 0).r;\n"
     "  }\n"
-    "  o = vec4(v, 0.0, 0.0, 1.0);\n"
+    "  o = v;\n"
     "}\n";
 
 /* Destination images are per-surface and stable, so importing one per frame
