@@ -163,6 +163,12 @@ static void mdp3_reset_streams(void)
 }
 
 /* Caller must hold g_mdp3_lock. */
+/* Tear the queues down and give the device up. The fd is deliberately NOT
+ * closed here: this runs on the async worker, while the decode thread may
+ * already hold the old descriptor number and be about to ioctl() it - if the
+ * number were recycled by any other open() in the meantime, that ioctl would
+ * land on an unrelated fd. The descriptor stays open (and unusable: out_bufs
+ * is 0) until mdp3_init_locked() reclaims it, or until fini. */
 static void mdp3_release_locked(void)
 {
     if (g_mdp3.fd < 0)
@@ -174,8 +180,6 @@ static void mdp3_release_locked(void)
     }
     mdp3_reqbufs(g_mdp3.fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, 0, V4L2_MEMORY_MMAP);
     mdp3_reqbufs(g_mdp3.fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, 0, V4L2_MEMORY_DMABUF);
-    close(g_mdp3.fd);
-    g_mdp3.fd = -1;
     g_mdp3.out_bufs = 0;
     g_mdp3.cap_bufs = 0;
     g_mdp3_owner = NULL;
@@ -288,10 +292,17 @@ static int mdp3_init_locked(struct v4l2sl_context *ctx, int width, int height)
             ctx->mdp3.disabled = 0;
             return 0;
         }
-        ctx->mdp3.disabled = 1;
-        fprintf(stderr,
-                "v4l2stateless: de-tile path = SW (mdp3 in use by another context)\n");
-        return -1;
+        if (!g_mdp3_owner) {
+            /* Released by the failure policy. Nothing can be queued on it, so
+             * it is safe to close here and open a fresh device below. */
+            close(g_mdp3.fd);
+            g_mdp3.fd = -1;
+        } else {
+            ctx->mdp3.disabled = 1;
+            fprintf(stderr,
+                    "v4l2stateless: de-tile path = SW (mdp3 in use by another context)\n");
+            return -1;
+        }
     }
     if (!v4l2sl_mdp3_requested()) {
         ctx->mdp3.disabled = 1;
@@ -415,7 +426,8 @@ int v4l2sl_mdp3_detile_prepared(struct v4l2sl_context *ctx,
     int cap_done, bo_fd, err;
 
     if (!ctx || !surf || !surf->gbm_bo || ctx->mdp3.disabled ||
-        g_mdp3.fd < 0 || g_mdp3_owner != ctx || y_fd < 0 || uv_fd < 0) {
+        g_mdp3.fd < 0 || !g_mdp3.out_bufs || g_mdp3_owner != ctx ||
+        y_fd < 0 || uv_fd < 0) {
         if (y_fd >= 0)
             close(y_fd);
         if (uv_fd >= 0)
@@ -426,10 +438,28 @@ int v4l2sl_mdp3_detile_prepared(struct v4l2sl_context *ctx,
     y_size = src_y_size(ctx);
     uv_size = src_uv_size(ctx);
     bo_rows = surf->bo_uv_rows;
-    if (!y_size || !uv_size || !bo_rows ||
-        surf->gbm_stride < g_mdp3.cap_stride ||
-        (uint64_t)surf->gbm_stride * (bo_rows + (bo_rows + 1) / 2) <
-            g_mdp3.cap_size) {
+    if (!y_size || !uv_size || !bo_rows) {
+        close(y_fd);
+        close(uv_fd);
+        return -1;
+    }
+    /* The m2m writes NV12 at its own bytesperline and the display bo is
+     * sampled at its own pitch, so the two must be equal: a wider bo pitch
+     * would displace every row by the difference (the picture shears). This
+     * is fixed per stream, so stop trying instead of failing every frame. */
+    if (surf->gbm_stride != g_mdp3.cap_stride) {
+        close(y_fd);
+        close(uv_fd);
+        if (!ctx->mdp3.disabled) {
+            ctx->mdp3.disabled = 1;
+            fprintf(stderr,
+                    "v4l2stateless: de-tile path = SW (bo pitch %u != mdp3 "
+                    "pitch %u)\n", surf->gbm_stride, g_mdp3.cap_stride);
+        }
+        return -1;
+    }
+    if ((uint64_t)surf->gbm_stride * (bo_rows + (bo_rows + 1) / 2) <
+        g_mdp3.cap_size) {
         close(y_fd);
         close(uv_fd);
         return -1;
@@ -590,6 +620,12 @@ void v4l2sl_mdp3_fini(struct v4l2sl_context *ctx)
     pthread_mutex_lock(&g_mdp3_lock);
     if (ctx && g_mdp3.fd >= 0 && g_mdp3_owner == ctx) {
         mdp3_release_locked();
+        /* Safe here and only here: the caller has already joined the async
+         * worker (v4l2sl_gbm_detile_wait) and reaped the GPU fences, so no
+         * thread can be holding this descriptor number. release_locked()
+         * deliberately leaves it open. */
+        close(g_mdp3.fd);
+        g_mdp3.fd = -1;
         ctx->mdp3.active = 0;
         ctx->mdp3.disabled = 1;
     }
