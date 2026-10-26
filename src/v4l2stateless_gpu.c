@@ -642,9 +642,16 @@ int v4l2sl_gpu_detile(struct v4l2sl_surface *s, int y_fd, int uv_fd)
     pthread_mutex_lock(&g_req.lock);
     if (!g_req.started) {
         if (pthread_create(&g_req.th, NULL, gpu_thread_main, NULL) != 0) {
+            int r;
+
             pthread_mutex_unlock(&g_req.lock);
-            /* No thread: run it here rather than dropping the frame. */
-            return gpu_job(s, y_fd, uv_fd);
+            /* No thread: run it here rather than dropping the frame. This
+             * function owns both fds on every path, so close them here too -
+             * gpu_job() deliberately leaves them to its caller. */
+            r = gpu_job(s, y_fd, uv_fd);
+            close(y_fd);
+            close(uv_fd);
+            return r;
         }
         g_req.started = 1;
     }
