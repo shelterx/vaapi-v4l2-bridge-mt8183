@@ -125,17 +125,23 @@ static pthread_mutex_t g_gpu_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Set once any job fails; the session stays on the software de-tile. */
 static int g_gpu_failed;
 
-/* Which surface's job is still reading each decoder capture slot. The GPU
- * keeps reading the source planes after the worker returns, so the slot must
- * not be handed back to the decoder until that job's fence has fired (the
- * write fence doubles as "sources fully read"). */
-static struct v4l2sl_surface *g_src_owner[V4L2SL_MAX_CAPTURE_BUFS];
-
-/* Surfaces holding an unreaped write fence. Teardown (capture renegotiation,
- * context destroy) must reap them all before the decoder's buffers go away;
- * a bounded table is enough because only one job runs at a time. */
-#define GPU_FENCED_MAX 32
+/* Surfaces holding an unreaped write fence. Two things need them:
+ *
+ *  - teardown (capture renegotiation, decode reset, context destroy), which
+ *    must reap them all before the decoder's buffers go away;
+ *  - the capture re-queue guard below, because a job keeps reading the source
+ *    planes after the worker returns - the write fence doubles as "sources
+ *    fully read", so the set of unreaped fences is exactly the set of
+ *    surfaces that may still be reading a capture slot.
+ *
+ * The bound is the number of capture slots (one unreaped fence per slot in
+ * use, reaped when that slot is re-queued), so size it from the slot count
+ * and not from "one job at a time" - jobs are serialised but fences linger.
+ * AV1 asks for V4L2SL_NUM_CAPTURE_BUFS_AV1 (40) slots, which is why a fixed 32
+ * would silently drop entries. */
+#define GPU_FENCED_MAX V4L2SL_MAX_CAPTURE_BUFS
 static struct v4l2sl_surface *g_fenced[GPU_FENCED_MAX];
+static int g_fenced_overflow_warned;
 
 /* Take the pending fence away from a surface so exactly one owner can close
  * it. Caller holds g_gpu_lock; this is the only place the field is cleared,
@@ -164,6 +170,13 @@ static void gpu_track_fenced_locked(struct v4l2sl_surface *s)
             g_fenced[i] = s;
             return;
         }
+    }
+    /* Cannot happen while the table is sized from the capture-slot count;
+     * if it ever does, say so instead of losing a fence that teardown needs. */
+    if (!g_fenced_overflow_warned) {
+        g_fenced_overflow_warned = 1;
+        fprintf(stderr, "v4l2stateless: gpu: fence table full (%d); teardown "
+                        "may not reap every fence\n", GPU_FENCED_MAX);
     }
 }
 
@@ -491,28 +504,31 @@ static int gpu_publish_write_fence(struct v4l2sl_surface *s, int bo_fd,
 /* Block until the GPU has finished writing this surface's bo. Only for CPU
  * access to the pixels (readback/memfd refill/destroy), never for the
  * per-frame handoff. */
-/* Note that a job for `s` is reading capture slot `idx`. */
-static void gpu_note_source(struct v4l2sl_surface *s)
-{
-    if (s->buf_index >= 0 && s->buf_index < V4L2SL_MAX_CAPTURE_BUFS)
-        g_src_owner[s->buf_index] = s;
-}
-
 /* Called before a capture slot goes back to the decoder: if a GPU job is
  * still reading it, wait for that job. Cheap when the job already finished
  * (poll on a signalled fence). */
-void v4l2sl_gpu_wait_capture(int buf_index)
+void v4l2sl_gpu_wait_capture(int fd, int buf_index)
 {
-    struct v4l2sl_surface *s;
+    struct v4l2sl_surface *hit[GPU_FENCED_MAX];
+    int n = 0;
 
-    if (buf_index < 0 || buf_index >= V4L2SL_MAX_CAPTURE_BUFS)
+    if (fd < 0 || buf_index < 0)
         return;
     pthread_mutex_lock(&g_gpu_lock);
-    s = g_src_owner[buf_index];
-    g_src_owner[buf_index] = NULL;
+    for (int i = 0; i < GPU_FENCED_MAX; i++) {
+        struct v4l2sl_surface *s = g_fenced[i];
+
+        /* Capture slot numbers are per decode context, so match the context
+         * as well: two contexts both have a slot N, and keying on the index
+         * alone let one context reap the other's fence while its own job was
+         * still reading the buffer. */
+        if (s && s->buf_index == buf_index && s->capture_owner &&
+            s->capture_owner->v4l2_fd == fd)
+            hit[n++] = s;
+    }
     pthread_mutex_unlock(&g_gpu_lock);
-    if (s)
-        v4l2sl_gpu_wait_surface(s);
+    for (int i = 0; i < n; i++)
+        v4l2sl_gpu_wait_surface(hit[i]);
 }
 
 void v4l2sl_gpu_wait_surface(struct v4l2sl_surface *s)
@@ -568,9 +584,6 @@ void v4l2sl_gpu_forget_surface(struct v4l2sl_surface *s)
         return;
     pthread_mutex_lock(&g_gpu_lock);
     fd = gpu_take_fence_locked(s);
-    for (int i = 0; i < V4L2SL_MAX_CAPTURE_BUFS; i++)
-        if (g_src_owner[i] == s)
-            g_src_owner[i] = NULL;
     pthread_mutex_unlock(&g_gpu_lock);
     if (fd >= 0)
         gpu_poll_close(fd, "surface destroy");
@@ -748,7 +761,6 @@ static int gpu_job(struct v4l2sl_surface *s, int y_fd, int uv_fd)
     bo_fd = gbm_bo_get_fd(s->gbm_bo);
     if (!ty || !tu || bo_fd < 0)
         goto release;
-    gpu_note_source(s);
     fbo = gpu_dst_fbo(s, bo_fd);
     if (!fbo)
         goto release;

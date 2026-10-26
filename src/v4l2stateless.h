@@ -550,8 +550,9 @@ int v4l2sl_gpu_usable(void);
  * ordered by the GPU queue and must not block. */
 void v4l2sl_gpu_wait_surface(struct v4l2sl_surface *s);
 /* Same, for a decoder capture slot about to be re-queued: the GPU job keeps
- * reading the plane dma-bufs after the worker returns. */
-void v4l2sl_gpu_wait_capture(int buf_index);
+ * reading the plane dma-bufs after the worker returns. `fd` is the decoder's
+ * fd, because slot numbers are only unique within one context. */
+void v4l2sl_gpu_wait_capture(int fd, int buf_index);
 /* Reap every outstanding GPU write fence; call before the decoder's capture
  * buffers are freed or renegotiated (they may still be read by the GPU). */
 void v4l2sl_gpu_wait_pending(void);

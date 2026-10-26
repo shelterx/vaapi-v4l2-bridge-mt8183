@@ -1271,7 +1271,7 @@ int v4l2sl_queue_capture(int fd, int buf_index, int request_fd)
     /* The GPU de-tile reads this capture slot through dma-bufs after the
      * worker thread has returned; the decoder must not refill it yet. */
     if (v4l2sl_detile_mode() == V4L2SL_DETILE_GPU)
-        v4l2sl_gpu_wait_capture(buf_index);
+        v4l2sl_gpu_wait_capture(fd, buf_index);
 
     if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
         fprintf(stderr, "v4l2stateless: QBUF capture[%d] failed: %s\n", buf_index, strerror(errno));
