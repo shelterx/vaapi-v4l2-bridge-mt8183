@@ -2445,6 +2445,42 @@ v4l2sl_init(VADriverContextP ctx)
 }
 
 /*
+ * Hand a capture slot back from a surface that holds no decoded picture.
+ *
+ * Chrome exports its whole surface pool up front, so a context can run out of
+ * slots for surfaces that will not decode for a while. A slot is only
+ * load-bearing while its surface holds a picture (the kernel resolves DPB
+ * references through those buffers), so a picture-less surface can give its
+ * slot away and claim a new one when it is actually decoded.
+ */
+/* Caller holds g_v4l2sl_lock (the export path takes it for the whole
+ * vaExportSurfaceHandle call). */
+int v4l2sl_reclaim_capture_slot(struct v4l2sl_context *ctx,
+                               struct v4l2sl_surface *keep)
+{
+    struct v4l2sl_driver_data *dd;
+    int reclaimed = -1;
+
+    if (!ctx || !ctx->driver_data)
+        return -1;
+    dd = ctx->driver_data;
+    for (unsigned id = 0; id < V4L2SL_MAX_SURFACES; id++) {
+        struct v4l2sl_surface *s = dd->surfaces[id];
+
+        if (!s || s == keep || s->capture_owner != ctx)
+            continue;
+        if (s->buf_index < 0 || s->has_pic)
+            continue;
+        v4l2sl_cap_pool_push(ctx, s->buf_index);
+        s->buf_index = -1;
+        s->cap_view = NULL;
+        reclaimed = 0;
+        break;
+    }
+    return reclaimed;
+}
+
+/*
  * libva entry point
  */
 VAStatus __vaDriverInit_1_20(VADriverContextP ctx)

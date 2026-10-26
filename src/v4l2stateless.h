@@ -565,6 +565,11 @@ void v4l2sl_gpu_fini(void);
 /* One-pass decode-buffer collection shared by every codec translate. */
 void v4l2sl_collect_decode_buffers(struct v4l2sl_buffer **buffers, int n,
                                    struct v4l2sl_collected *cb);
+/* Give a capture slot back from a surface that holds no picture, for when a
+ * context's free pool is exhausted by Chrome's up-front surface export.
+ * Caller must hold the driver lock (g_v4l2sl_lock). */
+int v4l2sl_reclaim_capture_slot(struct v4l2sl_context *ctx,
+                                struct v4l2sl_surface *keep);
 /* Single-object VADRMPRIMESurfaceDescriptor layout shared by the memfd
  * and GBM-bo export paths: 2 planes at `pitch`, chroma starting at row
  * `chroma_row`; SEPARATE_LAYERS splits them into two single-plane

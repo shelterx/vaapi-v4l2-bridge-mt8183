@@ -965,6 +965,22 @@ int v4l2sl_ensure_capture(struct v4l2sl_context *ctx, int width, int height,
     {
         int want_cap = ctx->codec == V4L2SL_CODEC_AV1 ?
                        V4L2SL_NUM_CAPTURE_BUFS_AV1 : V4L2SL_NUM_CAPTURE_BUFS;
+
+        /* Every exported surface claims one capture slot (Chrome exports its
+         * whole surface pool before the first picture, see
+         * v4l2sl_claim_capture_for_export), so the queue has to cover that
+         * pool. One slot short and the extra surfaces never receive a
+         * picture - the stream shows stale/green frames while its neighbours
+         * are fine. vaCreateContext() told us the pool size, and H.264 only
+         * sets the queue up at the first picture, so it is known here. */
+        if (ctx->num_render_targets > 0) {
+            int need = ctx->num_render_targets + 4;
+
+            if (need > V4L2SL_MAX_CAPTURE_BUFS)
+                need = V4L2SL_MAX_CAPTURE_BUFS;
+            if (need > want_cap)
+                want_cap = need;
+        }
         n_cap = v4l2sl_setup_capture_queue_count(ctx->v4l2_fd, width, height,
                                                  fourcc, want_cap);
     }
@@ -1993,9 +2009,13 @@ int v4l2sl_claim_capture_for_export(struct v4l2sl_context *ctx,
     }
     if (surf->buf_index >= 0)
         return 0;
+    if (ctx->n_free_cap == 0)
+        v4l2sl_reclaim_capture_slot(ctx, surf);
     if (ctx->n_free_cap == 0) {
-        fprintf(stderr, "v4l2stateless: claim capture: no free slot surf=%u\n",
-                (unsigned)surf->surface_id);
+        fprintf(stderr, "v4l2stateless: claim capture: no free slot surf=%u "
+                        "(%d buffers, ctx pool of %d surfaces)\n",
+                (unsigned)surf->surface_id, ctx->capture_bufs_allocd,
+                ctx->num_render_targets);
         return -1;
     }
     idx = ctx->free_cap_bufs[--ctx->n_free_cap];
