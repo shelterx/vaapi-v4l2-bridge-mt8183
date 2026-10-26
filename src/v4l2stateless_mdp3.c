@@ -119,6 +119,49 @@ static int mdp3_stream(int fd, uint32_t type, int on)
     return ioctl(fd, on ? VIDIOC_STREAMON : VIDIOC_STREAMOFF, &t);
 }
 
+/* poll() for a job completion, retrying on EINTR with whatever is left of the
+ * budget. A signal is not a job failure, and treating it as one leaves both
+ * queues holding buffers that the next frame cannot re-queue. */
+static int mdp3_poll_ms(int fd, int timeout_ms)
+{
+    struct pollfd pfd;
+    double deadline = mdp3_now_ms() + timeout_ms;
+
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    for (;;) {
+        double left = deadline - mdp3_now_ms();
+        int r;
+
+        if (left <= 0)
+            return 0;
+        r = poll(&pfd, 1, (int)left + 1);
+        if (r >= 0)
+            return r;
+        if (errno != EINTR)
+            return -1;
+    }
+}
+
+/* Stop the engine and drop whatever is queued. Needed when a job is abandoned
+ * (timeout, or a DQBUF that did not complete): the m2m keeps writing the
+ * CAPTURE target - which is the surface's display bo - and the software
+ * fallback would otherwise write that same buffer concurrently. STREAMOFF
+ * aborts the job and returns every buffer to userspace; stream both queues
+ * again so the next frame can start cleanly. */
+static void mdp3_reset_streams(void)
+{
+    if (g_mdp3.fd < 0)
+        return;
+    if (mdp3_log())
+        fprintf(stderr, "v4l2stateless: mdp3: resetting streams after a "
+                        "failed job\n");
+    mdp3_stream(g_mdp3.fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, 0);
+    mdp3_stream(g_mdp3.fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, 0);
+    mdp3_stream(g_mdp3.fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, 1);
+    mdp3_stream(g_mdp3.fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, 1);
+}
+
 /* Caller must hold g_mdp3_lock. */
 static void mdp3_release_locked(void)
 {
@@ -368,7 +411,6 @@ int v4l2sl_mdp3_detile_prepared(struct v4l2sl_context *ctx,
 {
     struct v4l2_buffer b = { 0 };
     struct v4l2_plane planes[2] = { 0 };
-    struct pollfd pfd;
     uint32_t y_size, uv_size, bo_rows;
     int cap_done, bo_fd, err;
 
@@ -449,15 +491,18 @@ int v4l2sl_mdp3_detile_prepared(struct v4l2sl_context *ctx,
 
     /* The driver pairs the queued OUTPUT with the queued CAPTURE and runs the
      * job; DQBUF returns the completed CAPTURE, already in the bo. */
-    pfd.fd = g_mdp3.fd;
-    pfd.events = POLLIN;
     {
         double t0 = mdp3_now_ms();
-        int pr = poll(&pfd, 1, MDP3_DQ_TIMEOUT_MS);
+        int pr = mdp3_poll_ms(g_mdp3.fd, MDP3_DQ_TIMEOUT_MS);
 
         mdp3_stage(2, mdp3_now_ms() - t0);
-        if (pr <= 0)
-            return mdp3_fail(ctx, "poll timeout", 0);
+        if (pr <= 0) {
+            /* Real timeout or error: the job may still be running, so stop it
+             * before the software de-tile writes the same bo. */
+            mdp3_reset_streams();
+            return mdp3_fail(ctx, pr == 0 ? "poll timeout" : "poll error",
+                             pr == 0 ? 0 : errno);
+        }
     }
 
     memset(&b, 0, sizeof(b));
@@ -469,13 +514,17 @@ int v4l2sl_mdp3_detile_prepared(struct v4l2sl_context *ctx,
     {
         double t0 = mdp3_now_ms();
 
-        if (ioctl(g_mdp3.fd, VIDIOC_DQBUF, &b) < 0)
+        if (ioctl(g_mdp3.fd, VIDIOC_DQBUF, &b) < 0) {
+            mdp3_reset_streams();
             return mdp3_fail(ctx, "DQBUF cap", errno);
+        }
         mdp3_stage(3, mdp3_now_ms() - t0);
     }
     cap_done = (int)b.index;
-    if (cap_done < 0 || cap_done >= g_mdp3.cap_bufs)
+    if (cap_done < 0 || cap_done >= g_mdp3.cap_bufs) {
+        mdp3_reset_streams();
         return mdp3_fail(ctx, "bad capture index", 0);
+    }
 
     /* Release the (now completed) OUTPUT buffer so its slot can be reused. */
     memset(&b, 0, sizeof(b));
@@ -487,8 +536,10 @@ int v4l2sl_mdp3_detile_prepared(struct v4l2sl_context *ctx,
     {
         double t0 = mdp3_now_ms();
 
-        if (ioctl(g_mdp3.fd, VIDIOC_DQBUF, &b) < 0)
+        if (ioctl(g_mdp3.fd, VIDIOC_DQBUF, &b) < 0) {
+            mdp3_reset_streams();
             return mdp3_fail(ctx, "DQBUF in", errno);
+        }
         mdp3_stage(4, mdp3_now_ms() - t0);
     }
 
