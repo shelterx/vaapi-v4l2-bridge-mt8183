@@ -1993,6 +1993,47 @@ int v4l2sl_capture_expbuf_plane(struct v4l2sl_context *ctx, int buf_index,
     return exp.fd;
 }
 
+/*
+ * Grow the capture queue at runtime. Every exported surface pins one slot
+ * for its life, and Chrome's surface pool can outgrow the 24-buffer default
+ * (vaCreateContext passes 0 render targets, so the size formula cannot see
+ * it). vb2 appends the extra buffers; in-flight buffers keep their indices,
+ * and capture buffers are QBUF'd per frame, so only the free pool changes.
+ * Best effort: CMA pressure keeps the pool as it is.
+ */
+static int v4l2sl_grow_capture_pool(struct v4l2sl_context *ctx)
+{
+    int old_n, new_n, i;
+    struct v4l2_requestbuffers req = { 0 };
+
+    if (!ctx || ctx->v4l2_fd < 0)
+        return 0;
+    old_n = ctx->capture_bufs_allocd;
+    new_n = old_n < 16 ? old_n * 2 : old_n + 8;
+    if (new_n > V4L2SL_MAX_CAPTURE_BUFS)
+        new_n = V4L2SL_MAX_CAPTURE_BUFS;
+    if (new_n <= old_n)
+        return 0;
+    req.count = new_n;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    req.memory = V4L2_MEMORY_MMAP;
+    req.flags = V4L2_MEMORY_FLAG_NON_COHERENT;
+    if (xioctl(ctx->v4l2_fd, VIDIOC_REQBUFS, &req) < 0) {
+        req.flags = 0;
+        if (xioctl(ctx->v4l2_fd, VIDIOC_REQBUFS, &req) < 0) {
+            fprintf(stderr, "v4l2stateless: capture pool grow %d->%d failed: %s\n",
+                    old_n, new_n, strerror(errno));
+            return 0;
+        }
+    }
+    for (i = old_n; i < new_n; i++)
+        v4l2sl_cap_pool_push(ctx, i);
+    ctx->capture_bufs_allocd = new_n;
+    fprintf(stderr, "v4l2stateless: capture pool grew %d -> %d\n",
+            old_n, new_n);
+    return new_n - old_n;
+}
+
 int v4l2sl_claim_capture_for_export(struct v4l2sl_context *ctx,
                                     struct v4l2sl_surface *surf)
 {
@@ -2011,9 +2052,12 @@ int v4l2sl_claim_capture_for_export(struct v4l2sl_context *ctx,
     }
     if (surf->buf_index >= 0)
         return 0;
-    if (ctx->n_free_cap == 0)
-        v4l2sl_reclaim_capture_slot(ctx, surf);
-    if (ctx->n_free_cap == 0) {
+    while (ctx->n_free_cap == 0) {
+        /* Reclaim frees one slot per call; drain every reclaimable one. */
+        if (v4l2sl_reclaim_capture_slot(ctx, surf) < 0)
+            break;
+    }
+    if (ctx->n_free_cap == 0 && v4l2sl_grow_capture_pool(ctx) <= 0) {
         fprintf(stderr, "v4l2stateless: claim capture: no free slot surf=%u "
                         "(%d buffers, ctx pool of %d surfaces)\n",
                 (unsigned)surf->surface_id, ctx->capture_bufs_allocd,
