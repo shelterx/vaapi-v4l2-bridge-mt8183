@@ -505,8 +505,10 @@ int v4l2sl_mdp3_detile_prepared(struct v4l2sl_context *ctx,
     b.m.planes = planes;
     planes[0].m.fd = y_fd;
     planes[0].length = y_size;
+    planes[0].bytesused = y_size;
     planes[1].m.fd = uv_fd;
     planes[1].length = uv_size;
+    planes[1].bytesused = uv_size;
     {
         double t0 = mdp3_now_ms();
 

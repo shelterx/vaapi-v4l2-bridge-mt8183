@@ -388,6 +388,9 @@ VAStatus v4l2sl_vpp_run(struct v4l2sl_context *ctx,
         obuf.index = 0;
         obuf.length = 1;
         obuf.m.planes = opl;
+        /* The whole plane is written by copy_rows_to; bytesused == 0 on
+         * output QBUF trips the kernel's deprecation warning. */
+        opl[0].bytesused = q->out_len[0];
         if (xioctl(fd, VIDIOC_QBUF, &obuf) < 0) {
             st = VA_STATUS_ERROR_OPERATION_FAILED;
             goto fail;
