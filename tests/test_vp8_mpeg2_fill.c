@@ -142,6 +142,7 @@ static void test_h264_sps_pps(void)
     struct v4l2_ctrl_h264_decode_params dec;
     VAIQMatrixBufferH264 iq;
     struct v4l2_ctrl_h264_scaling_matrix sm;
+    int nal_type_dummy = 0, nri_dummy = 0;
 
     memset(&pic, 0, sizeof(pic));
     memset(&slice, 0, sizeof(slice));
@@ -181,9 +182,35 @@ static void test_h264_sps_pps(void)
     pic.pic_fields.bits.reference_pic_flag = 1;
     for (int i = 0; i < 16; i++)
         pic.ReferenceFrames[i].flags = VA_PICTURE_H264_INVALID;
-    h264_fill_decode_params(&dec, &pic, NULL, &sps, &slice);
+    /* IDR comes from the NAL type (5), never from I-slice + frame_num 0. */
+    h264_fill_decode_params(&dec, &pic, NULL, &sps, &slice, 5, 3);
     expect_true(dec.flags & V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC, "h264-idr");
     expect_true(dec.frame_num == 0, "h264-fn0");
+    expect_true(dec.nal_ref_idc == 3, "h264-idr-nri");
+    expect_true(dec.dec_ref_pic_marking_bit_size == 2, "h264-idr-marking");
+
+    /* Regression: a non-IDR I frame with frame_num 0 (frame_num wrap, open
+     * GOP) must not be flagged IDR — the kernel would then flush its
+     * references and every following P frame would be smeared until the next
+     * IDR. This is the YouTube 1080p60 case that motivated the check. */
+    h264_fill_decode_params(&dec, &pic, NULL, &sps, &slice, 1, 2);
+    expect_true(!(dec.flags & V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC),
+                "h264-nonidr-i");
+    expect_true(dec.nal_ref_idc == 2, "h264-nonidr-nri");
+    expect_true(dec.dec_ref_pic_marking_bit_size == 1, "h264-nonidr-marking");
+
+    /* NAL scan: skips non-VCL NALs, handles bare and Annex B forms. */
+    expect_true(h264_first_vcl_nal((const uint8_t *)"\x00\x00\x00\x01\x27\x42",
+                                   6, &nal_type_dummy, &nri_dummy) == 0,
+                "h264-nalscan-sps-only");
+    expect_true(h264_first_vcl_nal((const uint8_t *)"\x00\x00\x01\x25\x88",
+                                   5, &nal_type_dummy, &nri_dummy) == 1 &&
+                    nal_type_dummy == 5 && nri_dummy == 1,
+                "h264-nalscan-idr");
+    expect_true(h264_first_vcl_nal((const uint8_t *)"\x65\x88", 2,
+                                   &nal_type_dummy, &nri_dummy) == 1 &&
+                    nal_type_dummy == 5 && nri_dummy == 3,
+                "h264-nalscan-bare");
 
     memset(&iq, 0, sizeof(iq));
     iq.ScalingList4x4[0][0] = 16;

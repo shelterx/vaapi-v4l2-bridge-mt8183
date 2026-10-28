@@ -28,6 +28,51 @@
 
 #include "v4l2stateless.h"
 
+/*
+ * First VCL NAL unit of a picture (types 1..5): the IDR flag and nal_ref_idc
+ * live only in the bitstream. The data may or may not carry Annex B start
+ * codes, and may begin with a non-VCL NAL (SPS/PPS/SEI), so walk the start
+ * codes and take the first NAL whose type is a slice. Emulation prevention
+ * forbids 00 00 01 inside a payload, so a match is a real start code.
+ */
+int h264_first_vcl_nal(const uint8_t *data, uint32_t size,
+                       int *nal_type, int *nal_ref_idc)
+{
+    const uint8_t *p, *end;
+
+    if (!data || size < 1)
+        return 0;
+    p = data;
+    end = data + size;
+    /* A bare NAL (no start code) is accepted: clients pass either form. */
+    if (!(p[0] == 0 && size >= 3 && p[1] == 0 && p[2] == 1)) {
+        int type = p[0] & 0x1f;
+
+        if (type < 1 || type > 5)
+            goto scan;
+        *nal_type = type;
+        *nal_ref_idc = (p[0] >> 5) & 0x3;
+        return 1;
+    }
+scan:
+    while (p + 3 < end) {
+        if (p[0] == 0 && p[1] == 0 && p[2] == 1) {
+            const uint8_t *h = p + 3;
+            int type = h[0] & 0x1f;
+
+            if (type >= 1 && type <= 5) {
+                *nal_type = type;
+                *nal_ref_idc = (h[0] >> 5) & 0x3;
+                return 1;
+            }
+            p = h;
+            continue;
+        }
+        p++;
+    }
+    return 0;
+}
+
 /* Convert VA-API SPS fields to V4L2 SPS flags */
 static uint32_t h264_sps_flags(const VAPictureParameterBufferH264 *pic)
 {
@@ -224,7 +269,8 @@ void h264_fill_decode_params(struct v4l2_ctrl_h264_decode_params *dec,
                              const VAPictureParameterBufferH264 *pic,
                              struct v4l2sl_driver_data *dd,
                              const struct v4l2_ctrl_h264_sps *sps,
-                             const VASliceParameterBufferH264 *slice)
+                             const VASliceParameterBufferH264 *slice,
+                             int nal_type, int nal_ref_idc)
 {
     uint32_t max_frame_num = 1u << (sps->log2_max_frame_num_minus4 + 4);
 
@@ -255,12 +301,27 @@ void h264_fill_decode_params(struct v4l2_ctrl_h264_decode_params *dec,
         dec->dpb[j + 1] = key;
     }
 
-    /* Current picture info */
-    int is_idr = 0;
+    /*
+     * Current picture info.
+     *
+     * IDR cannot be inferred from the VA picture parameters: slice_type == I
+     * with frame_num == 0 is also a plain (non-IDR) I frame right after a
+     * frame_num wrap, which open-GOP encoders emit regularly. Flagging such a
+     * frame as IDR makes the kernel flush its reference list, so every P frame
+     * until the next real IDR references pictures the decoder dropped — a
+     * smear that starts at one fixed frame and lasts until the next keyframe.
+     * Take the NAL type (5 = IDR) and nal_ref_idc from the slice data instead.
+     */
+    int is_idr = nal_type == 5;
     unsigned st = slice ? slice->slice_type % 5 : 2;
-    if (st == 2 && pic->frame_num == 0)
-        is_idr = 1;  /* no idr_pic_flag in this libva; I slice + frame_num 0 */
-    dec->nal_ref_idc = is_idr ? 3 : (pic->pic_fields.bits.reference_pic_flag ? 2 : 0);
+
+    if (nal_type < 1) {
+        /* No readable NAL header (unexpected): keep the old heuristic. */
+        is_idr = (st == 2 && pic->frame_num == 0);
+        nal_ref_idc = is_idr ? 3
+                             : (pic->pic_fields.bits.reference_pic_flag ? 2 : 0);
+    }
+    dec->nal_ref_idc = (uint8_t)nal_ref_idc;
     dec->frame_num = pic->frame_num;
     dec->top_field_order_cnt = pic->CurrPic.TopFieldOrderCnt;
     dec->bottom_field_order_cnt = pic->CurrPic.BottomFieldOrderCnt;
@@ -277,7 +338,7 @@ void h264_fill_decode_params(struct v4l2_ctrl_h264_decode_params *dec,
      */
     if (is_idr) {
         dec->dec_ref_pic_marking_bit_size = 2;
-    } else if (pic->pic_fields.bits.reference_pic_flag) {
+    } else if (dec->nal_ref_idc) {
         dec->dec_ref_pic_marking_bit_size = 1;
     }
     if (pic->seq_fields.bits.pic_order_cnt_type == 0)
@@ -370,8 +431,19 @@ VAStatus v4l2sl_h264_translate(struct v4l2sl_context *ctx,
 
     h264_fill_sps(&sps, pic_param, ctx->profile);
     h264_fill_pps(&pps, pic_param, slice_param);
-    h264_fill_decode_params(&dec, pic_param, ctx->driver_data, &sps,
-                            slice_param);
+    {
+        /* IDR / nal_ref_idc come from the bitstream, not from the VA picture
+         * parameters (see h264_fill_decode_params). */
+        int nal_type = -1, nal_ref_idc = -1;
+
+        if (!h264_first_vcl_nal(cb.slice_datas[0], cb.slice_sizes[0],
+                                &nal_type, &nal_ref_idc)) {
+            nal_type = -1;
+            nal_ref_idc = -1;
+        }
+        h264_fill_decode_params(&dec, pic_param, ctx->driver_data, &sps,
+                                slice_param, nal_type, nal_ref_idc);
+    }
 
     if (iq_matrix)
         h264_fill_scaling_matrix(&sm, iq_matrix);

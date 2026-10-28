@@ -600,7 +600,13 @@ void h264_fill_decode_params(struct v4l2_ctrl_h264_decode_params *dec,
                              const VAPictureParameterBufferH264 *pic,
                              struct v4l2sl_driver_data *dd,
                              const struct v4l2_ctrl_h264_sps *sps,
-                             const VASliceParameterBufferH264 *slice);
+                             const VASliceParameterBufferH264 *slice,
+                             int nal_type, int nal_ref_idc);
+/* First VCL NAL unit of a picture: type (5 = IDR) and nal_ref_idc, taken from
+ * the bitstream because VA-API exposes neither. Returns 0 when the data holds
+ * no readable VCL NAL header. */
+int h264_first_vcl_nal(const uint8_t *data, uint32_t size,
+                       int *nal_type, int *nal_ref_idc);
 void h264_fill_scaling_matrix(struct v4l2_ctrl_h264_scaling_matrix *sm,
                               const VAIQMatrixBufferH264 *iq);
 VAStatus v4l2sl_h264_translate(struct v4l2sl_context *ctx,
