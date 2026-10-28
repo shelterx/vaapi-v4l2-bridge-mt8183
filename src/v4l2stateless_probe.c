@@ -118,6 +118,72 @@ int v4l2sl_find_media_path(const char *video_path, char *out, unsigned out_len)
     return found ? 0 : -1;
 }
 
+/*
+ * V4L2SL_DISABLE_CODECS — comma-separated list of codec tokens to exclude
+ * from probing: h264,hevc,av1,vp8,mpeg2,jpeg,vpp. A disabled codec comes
+ * back empty, i.e. exactly the "device absent" state the rest of the
+ * driver already handles (vaCreateConfig fails with
+ * VA_STATUS_ERROR_UNSUPPORTED_PROFILE). Besides skipping the probe itself,
+ * a disabled mtk_jpeg node is never even opened: on kernels older than
+ * 6.18.39 its release path fires a WARN_ON on close (upstream
+ * b1845a227fda), and the open is what triggers it.
+ */
+struct v4l2sl_disable {
+    int h264, hevc, av1, vp8, mpeg2, jpeg, vpp;
+};
+
+static void parse_disable_codecs(struct v4l2sl_disable *d)
+{
+    char buf[128];
+    char *save = NULL, *tok;
+
+    memset(d, 0, sizeof(*d));
+    if (!getenv("V4L2SL_DISABLE_CODECS"))
+        return;
+    strncpy(buf, getenv("V4L2SL_DISABLE_CODECS"), sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = 0;
+    for (tok = strtok_r(buf, ",", &save); tok;
+         tok = strtok_r(NULL, ",", &save)) {
+        while (*tok == ' ')
+            tok++;
+        if (!strcmp(tok, "h264"))
+            d->h264 = 1;
+        else if (!strcmp(tok, "hevc"))
+            d->hevc = 1;
+        else if (!strcmp(tok, "av1"))
+            d->av1 = 1;
+        else if (!strcmp(tok, "vp8"))
+            d->vp8 = 1;
+        else if (!strcmp(tok, "mpeg2"))
+            d->mpeg2 = 1;
+        else if (!strcmp(tok, "jpeg"))
+            d->jpeg = 1;
+        else if (!strcmp(tok, "vpp"))
+            d->vpp = 1;
+    }
+}
+
+static void apply_disable_codecs(const struct v4l2sl_disable *d,
+                                 char *h264, char *hevc, char *av1,
+                                 char *vp8, char *mpeg2, char *jpeg,
+                                 char *vpp)
+{
+    if (d->h264 && h264)
+        h264[0] = 0;
+    if (d->hevc && hevc)
+        hevc[0] = 0;
+    if (d->av1 && av1)
+        av1[0] = 0;
+    if (d->vp8 && vp8)
+        vp8[0] = 0;
+    if (d->mpeg2 && mpeg2)
+        mpeg2[0] = 0;
+    if (d->jpeg && jpeg)
+        jpeg[0] = 0;
+    if (d->vpp && vpp)
+        vpp[0] = 0;
+}
+
 int v4l2sl_video_has_request_api(const char *video_path)
 {
     char media_path[128];
@@ -202,7 +268,8 @@ static int node_has_coded_output(const struct scan_node *nd)
  * least one OUTPUT or CAPTURE format (unified accept criteria), carrying
  * its fourcc lists plus the JPEG-encoder / RGA markers callers filter on.
  * Returns the node count. */
-static int scan_nodes(struct scan_node *nodes, int max_nodes)
+static int scan_nodes(struct scan_node *nodes, int max_nodes,
+                      const struct v4l2sl_disable *dis)
 {
     int i, n = 0;
 
@@ -212,6 +279,26 @@ static int scan_nodes(struct scan_node *nodes, int max_nodes)
         int fd;
 
         snprintf(nodes[n].path, sizeof(nodes[n].path), "/dev/video%d", i);
+
+        /* Identify mtk_jpeg from sysfs before opening, so a disabled
+         * JPEG probe never touches the device at all. */
+        if (dis->jpeg) {
+            char link[128], drv[256];
+            const char *base;
+            ssize_t len;
+
+            snprintf(link, sizeof(link),
+                     "/sys/class/video4linux/video%d/device/driver", i);
+            len = readlink(link, drv, sizeof(drv) - 1);
+            if (len > 0) {
+                drv[len] = 0;
+                base = strrchr(drv, '/');
+                base = base ? base + 1 : drv;
+                if (!strcmp(base, "mtk-jpeg"))
+                    continue;
+            }
+        }
+
         fd = open(nodes[n].path, O_RDWR | O_NONBLOCK);
         if (fd < 0)
             continue;
@@ -259,6 +346,7 @@ int v4l2sl_scan_decoder_paths_ex(char *h264_out, char *hevc_out, char *av1_out,
 {
     struct v4l2sl_node_fmts nodes[V4L2SL_PROBE_MAX_NODES];
     struct scan_node raw[V4L2SL_PROBE_MAX_NODES];
+    struct v4l2sl_disable dis;
     int n_raw, i, n_nodes = 0;
     const char *p;
 
@@ -273,7 +361,8 @@ int v4l2sl_scan_decoder_paths_ex(char *h264_out, char *hevc_out, char *av1_out,
     if (mpeg2_out && out_len)
         mpeg2_out[0] = 0;
 
-    n_raw = scan_nodes(raw, V4L2SL_PROBE_MAX_NODES);
+    parse_disable_codecs(&dis);
+    n_raw = scan_nodes(raw, V4L2SL_PROBE_MAX_NODES, &dis);
     for (i = 0; i < n_raw && n_nodes < V4L2SL_PROBE_MAX_NODES; i++) {
         if (raw[i].has_jpeg_cap || !node_has_coded_output(&raw[i]))
             continue; /* JPEG encoders and raw converters are not decoders */
@@ -296,6 +385,8 @@ int v4l2sl_scan_decoder_paths_ex(char *h264_out, char *hevc_out, char *av1_out,
     p = v4l2sl_pick_device_for_codec(V4L2SL_CODEC_MPEG2, nodes, n_nodes);
     copy_path(mpeg2_out, out_len, p);
 
+    apply_disable_codecs(&dis, h264_out, hevc_out, av1_out, vp8_out,
+                         mpeg2_out, NULL, NULL);
     return 0;
 }
 
@@ -336,13 +427,30 @@ static int fourcc_in(const uint32_t *list, unsigned n, uint32_t fcc)
  */
 #define PROBE_CACHE_SUFFIX "/v4l2stateless-probe.cache"
 
-static void probe_cache_path(char *out, unsigned len)
+static void probe_cache_path(char *out, unsigned len,
+                             const struct v4l2sl_disable *d)
 {
     const char *dir = getenv("XDG_RUNTIME_DIR");
+    char tok[96] = "";
 
     if (!dir || !dir[0])
         dir = "/tmp";
-    snprintf(out, len, "%s%s", dir, PROBE_CACHE_SUFFIX);
+    /* A non-empty disable list gets its own cache file: its stored result
+     * has those codecs blanked and must not be served to processes that
+     * probe without the restriction. */
+    if (d->h264) strcat(tok, "h264-");
+    if (d->hevc) strcat(tok, "hevc-");
+    if (d->av1) strcat(tok, "av1-");
+    if (d->vp8) strcat(tok, "vp8-");
+    if (d->mpeg2) strcat(tok, "mpeg2-");
+    if (d->jpeg) strcat(tok, "jpeg-");
+    if (d->vpp) strcat(tok, "vpp-");
+    if (tok[0]) {
+        tok[strlen(tok) - 1] = 0; /* drop trailing '-' */
+        snprintf(out, len, "%s%s.%s", dir, PROBE_CACHE_SUFFIX, tok);
+    } else {
+        snprintf(out, len, "%s%s", dir, PROBE_CACHE_SUFFIX);
+    }
 }
 
 static int probe_read_boot_id(char *out, unsigned len)
@@ -438,6 +546,7 @@ static int scan_all_uncached(char *h264_out, char *hevc_out, char *av1_out,
 {
     struct v4l2sl_node_fmts nodes[V4L2SL_PROBE_MAX_NODES];
     struct scan_node raw[V4L2SL_PROBE_MAX_NODES];
+    struct v4l2sl_disable dis;
     int n_raw, i, n_nodes = 0;
     const char *p;
 
@@ -449,7 +558,8 @@ static int scan_all_uncached(char *h264_out, char *hevc_out, char *av1_out,
     if (jpeg_enc_out && out_len) jpeg_enc_out[0] = 0;
     if (vpp_out && out_len) vpp_out[0] = 0;
 
-    n_raw = scan_nodes(raw, V4L2SL_PROBE_MAX_NODES);
+    parse_disable_codecs(&dis);
+    n_raw = scan_nodes(raw, V4L2SL_PROBE_MAX_NODES, &dis);
     for (i = 0; i < n_raw && n_nodes < V4L2SL_PROBE_MAX_NODES; i++) {
         if (raw[i].has_jpeg_cap && jpeg_enc_out && out_len && !jpeg_enc_out[0])
             copy_path(jpeg_enc_out, out_len, raw[i].path);
@@ -507,8 +617,10 @@ int v4l2sl_scan_all_cached(char *h264_out, char *hevc_out, char *av1_out,
     char path[280];
     char boot[64];
     int loaded = 0;
+    struct v4l2sl_disable dis;
 
-    probe_cache_path(path, sizeof(path));
+    parse_disable_codecs(&dis);
+    probe_cache_path(path, sizeof(path), &dis);
     if (h264_out && out_len) h264_out[0] = 0;
     if (hevc_out && out_len) hevc_out[0] = 0;
     if (av1_out && out_len) av1_out[0] = 0;
@@ -524,6 +636,8 @@ int v4l2sl_scan_all_cached(char *h264_out, char *hevc_out, char *av1_out,
         if (cache_nodes_ok(h264_out, hevc_out, av1_out, vp8_out, mpeg2_out,
                            jpeg_enc_out, vpp_out)) {
             fprintf(stderr, "v4l2stateless: probe cache hit (%s)\n", path);
+            apply_disable_codecs(&dis, h264_out, hevc_out, av1_out,
+                                 vp8_out, mpeg2_out, jpeg_enc_out, vpp_out);
             return 0;
         }
         loaded = 1;
@@ -545,5 +659,10 @@ int v4l2sl_scan_all_cached(char *h264_out, char *hevc_out, char *av1_out,
                           mpeg2_out && mpeg2_out[0] ? mpeg2_out : "",
                           jpeg_enc_out && jpeg_enc_out[0] ? jpeg_enc_out : "",
                           vpp_out && vpp_out[0] ? vpp_out : "");
+
+    /* Blank after storing: the cache keeps the full result, the
+     * restriction is per-process. */
+    apply_disable_codecs(&dis, h264_out, hevc_out, av1_out, vp8_out,
+                         mpeg2_out, jpeg_enc_out, vpp_out);
     return 0;
 }
