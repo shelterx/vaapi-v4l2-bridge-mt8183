@@ -1010,7 +1010,7 @@ int v4l2sl_ensure_capture(struct v4l2sl_context *ctx, int width, int height,
     ctx->n_free_cap = 0;
     {
         int i;
-        for (i = 0; i < n_cap && i < V4L2SL_NUM_CAPTURE_BUFS; i++)
+        for (i = 0; i < n_cap && i < V4L2SL_MAX_CAPTURE_BUFS; i++)
             v4l2sl_cap_pool_push(ctx, i);
     }
     ctx->width = width;
@@ -1060,7 +1060,7 @@ static void v4l2sl_unmap_capture_buffers(struct v4l2sl_context *ctx)
 
     if (!ctx)
         return;
-    for (i = 0; i < V4L2SL_NUM_CAPTURE_BUFS; i++) {
+    for (i = 0; i < V4L2SL_MAX_CAPTURE_BUFS; i++) {
         if (ctx->capture_buf_ptr[i] && ctx->capture_buf_ptr[i] != MAP_FAILED) {
             if (ctx->capture_buf_anon)
                 free(ctx->capture_buf_ptr[i]);
@@ -1090,7 +1090,7 @@ static int v4l2sl_mmap_one_capture(struct v4l2sl_context *ctx, int index)
     int anon, npl;
 
     if (!ctx || ctx->v4l2_fd < 0 || index < 0 ||
-        index >= ctx->capture_bufs_allocd || index >= V4L2SL_NUM_CAPTURE_BUFS)
+        index >= ctx->capture_bufs_allocd || index >= V4L2SL_MAX_CAPTURE_BUFS)
         return -1;
     if (ctx->capture_buf_ptr[index] && ctx->capture_buf_ptr[index] != MAP_FAILED)
         return 0;
@@ -1997,41 +1997,65 @@ int v4l2sl_capture_expbuf_plane(struct v4l2sl_context *ctx, int buf_index,
  * Grow the capture queue at runtime. Every exported surface pins one slot
  * for its life, and Chrome's surface pool can outgrow the 24-buffer default
  * (vaCreateContext passes 0 render targets, so the size formula cannot see
- * it). vb2 appends the extra buffers; in-flight buffers keep their indices,
- * and capture buffers are QBUF'd per frame, so only the free pool changes.
- * Best effort: CMA pressure keeps the pool as it is.
+ * it). CREATE_BUFS appends the extra buffers — in-flight buffers keep
+ * their indices and the queue keeps streaming (REQBUFS cannot: -EBUSY while
+ * streaming, and otherwise it frees and reallocates the whole queue). The
+ * kernel reports how many it actually created, so CMA pressure degrades
+ * the pool gracefully. Best effort: on failure the pool stays as it is.
  */
 static int v4l2sl_grow_capture_pool(struct v4l2sl_context *ctx)
 {
-    int old_n, new_n, i;
-    struct v4l2_requestbuffers req = { 0 };
+    int old_n, want, created, i;
+    struct v4l2_format fmt;
+    struct v4l2_create_buffers create = { 0 };
 
     if (!ctx || ctx->v4l2_fd < 0)
         return 0;
     old_n = ctx->capture_bufs_allocd;
-    new_n = old_n < 16 ? old_n * 2 : old_n + 8;
-    if (new_n > V4L2SL_MAX_CAPTURE_BUFS)
-        new_n = V4L2SL_MAX_CAPTURE_BUFS;
-    if (new_n <= old_n)
+    want = old_n < 16 ? old_n * 2 : old_n + 8;
+    if (want > V4L2SL_MAX_CAPTURE_BUFS)
+        want = V4L2SL_MAX_CAPTURE_BUFS;
+    if (want <= old_n)
         return 0;
-    req.count = new_n;
-    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    req.memory = V4L2_MEMORY_MMAP;
-    req.flags = V4L2_MEMORY_FLAG_NON_COHERENT;
-    if (xioctl(ctx->v4l2_fd, VIDIOC_REQBUFS, &req) < 0) {
-        req.flags = 0;
-        if (xioctl(ctx->v4l2_fd, VIDIOC_REQBUFS, &req) < 0) {
-            fprintf(stderr, "v4l2stateless: capture pool grow %d->%d failed: %s\n",
-                    old_n, new_n, strerror(errno));
+
+    /* CREATE_BUFS takes the format explicitly; reuse what the queue has
+     * latched since context setup (S_FMT). The coherency flag must match
+     * the existing buffers — vb2 rejects a mismatch on append — so try
+     * cacheable first, exactly like the initial setup, then coherent. */
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    if (xioctl(ctx->v4l2_fd, VIDIOC_G_FMT, &fmt) < 0) {
+        fprintf(stderr, "v4l2stateless: capture pool grow: G_FMT failed: %s\n",
+                strerror(errno));
+        return 0;
+    }
+    create.count = want - old_n;
+    create.memory = V4L2_MEMORY_MMAP;
+    create.format = fmt;
+    create.flags = V4L2_MEMORY_FLAG_NON_COHERENT;
+    if (xioctl(ctx->v4l2_fd, VIDIOC_CREATE_BUFS, &create) < 0) {
+        create.flags = 0;
+        if (xioctl(ctx->v4l2_fd, VIDIOC_CREATE_BUFS, &create) < 0) {
+            fprintf(stderr, "v4l2stateless: capture pool grow %d->%d failed: %s%s\n",
+                    old_n, want, strerror(errno),
+                    errno == ENOBUFS ? " (queue buffer max reached)" : "");
             return 0;
         }
     }
-    for (i = old_n; i < new_n; i++)
-        v4l2sl_cap_pool_push(ctx, i);
-    ctx->capture_bufs_allocd = new_n;
-    fprintf(stderr, "v4l2stateless: capture pool grew %d -> %d\n",
-            old_n, new_n);
-    return new_n - old_n;
+    /* Honor what the kernel actually created: it may be fewer (CMA pressure,
+     * or the queue's buffer ceiling), and it owns the index base of the
+     * appended buffers. Report the request against the grant rather than
+     * guessing which of the two limited it. */
+    created = (int)create.count;
+    if (created <= 0)
+        return 0;
+    for (i = 0; i < created; i++)
+        v4l2sl_cap_pool_push(ctx, (int)create.index + i);
+    ctx->capture_bufs_allocd = (int)create.index + created;
+    fprintf(stderr, "v4l2stateless: capture pool grew %d -> %d (asked +%d, "
+                    "got +%d)\n",
+            old_n, ctx->capture_bufs_allocd, want - old_n, created);
+    return created;
 }
 
 int v4l2sl_claim_capture_for_export(struct v4l2sl_context *ctx,
