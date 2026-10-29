@@ -404,12 +404,16 @@ static void release_ctx_capture_surfaces(struct v4l2sl_context *ctx)
 
     if (!ctx || !ctx->driver_data)
         return;
-    for (i = 0; i < ctx->num_render_targets; i++) {
-        VASurfaceID id = ctx->render_targets[i];
-        struct v4l2sl_surface *s;
+    /* Every surface that claimed a slot on this ctx, not just the render
+     * targets: Chrome exports its whole surface pool, and in the
+     * 0-render-targets pattern none of the claimants is a render target.
+     * A stale claim surviving a queue rebuild decodes into an index the
+     * new queue does not have (QBUF/QUERYBUF EINVAL) or, when the index is
+     * inside the new queue, double-claims a live slot. */
+    for (i = 0; i < V4L2SL_MAX_SURFACES; i++) {
+        struct v4l2sl_surface *s = ctx->driver_data->surfaces[i];
 
-        s = v4l2sl_surface_by_id(ctx->driver_data, id);
-        if (!s)
+        if (!s || s->capture_owner != ctx)
             continue;
         /* Keep the create-time memfd. Closing a V4L2 EXPBUF fd while the
          * GPU still holds a dup hangs the RK3588 CMA pool. */
@@ -430,12 +434,14 @@ static void rebuild_free_pools(struct v4l2sl_context *ctx)
     for (i = 0; i < ctx->output_bufs_allocd && i < V4L2SL_NUM_OUTPUT_BUFS; i++)
         v4l2sl_out_pool_push(ctx, i);
 
-    if (ctx->driver_data && ctx->render_targets) {
-        for (i = 0; i < ctx->num_render_targets; i++) {
-            struct v4l2sl_surface *s =
-                v4l2sl_surface_by_id(ctx->driver_data, ctx->render_targets[i]);
+    /* Claims can live on any surface owned by this ctx (see
+     * release_ctx_capture_surfaces), not only the render targets. */
+    if (ctx->driver_data) {
+        for (i = 0; i < V4L2SL_MAX_SURFACES; i++) {
+            struct v4l2sl_surface *s = ctx->driver_data->surfaces[i];
 
-            if (s && s->buf_index >= 0 && s->buf_index < V4L2SL_MAX_CAPTURE_BUFS)
+            if (s && s->capture_owner == ctx &&
+                s->buf_index >= 0 && s->buf_index < V4L2SL_MAX_CAPTURE_BUFS)
                 claimed[s->buf_index] = 1;
         }
     }
