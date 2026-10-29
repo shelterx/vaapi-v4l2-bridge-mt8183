@@ -3,7 +3,7 @@
  * out the real decoded pixels.
  *
  * Decodes an all-IDR 8-bit 4:2:0 stream through the bridge (same canned
- * clip family as va_h264422_client), then for every frame:
+ * clip family the old 4:2:2 client used), then for every frame:
  *   1. grabs the reference bytes with vaGetImage (NV12)
  *   2. calls vaExportSurfaceHandle(DRM_PRIME_2, COMPOSED_LAYERS) and
  *      checks the descriptor is the single-object NV12 shape Chromium

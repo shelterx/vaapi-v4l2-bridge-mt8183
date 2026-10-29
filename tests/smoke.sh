@@ -33,7 +33,7 @@ echo "===== vainfo ====="
 vainfo --display drm --device /dev/dri/renderD128 >"$OUT/vainfo.log" 2>&1 || true
 if grep -q "v4l2stateless/vaapi-v4l2-bridge" "$OUT/vainfo.log"; then
   echo "VAINFO_DRIVER_OK"; pass=$((pass+1))
-  # AV1 intentionally un-advertised (see run_full_matrix.sh vainfo block).
+  # AV1 intentionally un-advertised (the bridge probes no AV1 decoder here).
   for p in VAProfileH264High VAProfileHEVCMain \
            VAProfileVP8Version0_3 VAProfileMPEG2Main VAProfileJPEGBaseline; do
     if grep -q "$p" "$OUT/vainfo.log"; then
