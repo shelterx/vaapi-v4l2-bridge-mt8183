@@ -266,6 +266,14 @@ struct v4l2sl_context {
     int capture_buf_anon; /* calloc stub when ioctl hook is installed */
     int free_cap_bufs[V4L2SL_MAX_CAPTURE_BUFS];
     int n_free_cap;
+    /* Live GPU de-tile write fences, one per capture slot in use: the GPU
+     * may still be reading a slot after the de-tile job returns, and the
+     * re-queue guard (v4l2sl_gpu_wait_capture) looks the slot up here. Per
+     * context and sized from this context's capture pool, so overflow is
+     * impossible - the old process-global table of the same size was shared
+     * across contexts and dropped fences under two streams (2 x 24 = 48).
+     * All access under the gpu lock. */
+    struct v4l2sl_surface *fenced[V4L2SL_MAX_CAPTURE_BUFS];
     uint32_t cap_width;        /* driver-chosen capture geometry */
     uint32_t cap_height;       /* aligned height (e.g. 1088 for 1080p) */
     uint32_t cap_stride;       /* bytes per row, may exceed width */
@@ -419,7 +427,8 @@ int v4l2sl_ensure_capture(struct v4l2sl_context *ctx, int width, int height,
                           uint32_t pixelformat);
 int v4l2sl_queue_output(struct v4l2sl_context *ctx, int buf_index,
                         uint32_t size, uint64_t timestamp);
-int v4l2sl_queue_capture(int fd, int buf_index, int request_fd);
+int v4l2sl_queue_capture(struct v4l2sl_context *ctx, int buf_index,
+                         int request_fd);
 /*
  * Submit one synchronous decode: pops a capture buffer, QBUFs the given
  * OUTPUT buffer (caller already memcpy'd the bitstream into it), queues the
@@ -552,10 +561,10 @@ void v4l2sl_gpu_wait_surface(struct v4l2sl_surface *s);
 /* Same, for a decoder capture slot about to be re-queued: the GPU job keeps
  * reading the plane dma-bufs after the worker returns. `fd` is the decoder's
  * fd, because slot numbers are only unique within one context. */
-void v4l2sl_gpu_wait_capture(int fd, int buf_index);
+void v4l2sl_gpu_wait_capture(struct v4l2sl_context *ctx, int buf_index);
 /* Reap every outstanding GPU write fence; call before the decoder's capture
  * buffers are freed or renegotiated (they may still be read by the GPU). */
-void v4l2sl_gpu_wait_pending(void);
+void v4l2sl_gpu_wait_pending(struct v4l2sl_context *ctx);
 /* Drop all GPU state pointing at a surface that is being destroyed. */
 void v4l2sl_gpu_forget_surface(struct v4l2sl_surface *s);
 /* Drop the cached destination image for a bo about to be destroyed; the

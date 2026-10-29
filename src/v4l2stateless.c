@@ -1631,8 +1631,11 @@ v4l2sl_sync_surface(VADriverContextP ctx, VASurfaceID render_target)
     struct v4l2sl_surface *surface;
 
     v4l2sl_gbm_detile_wait();
-    v4l2sl_gpu_wait_pending();  /* a sync request means "the frame is done" */
     pthread_mutex_lock(&g_v4l2sl_lock);
+    /* A sync request means "the frame is done": reap every context's live
+     * GPU fences (the old global table made this a single call). */
+    for (struct v4l2sl_context *c = driver_data->contexts; c; c = c->next)
+        v4l2sl_gpu_wait_pending(c);
     surface = v4l2sl_surface_by_id(driver_data, render_target);
     if (!surface) {
         if (v4l2sl_debug)

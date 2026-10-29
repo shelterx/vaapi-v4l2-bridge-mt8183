@@ -144,7 +144,8 @@ static pthread_mutex_t g_gpu_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Set once any job fails; the session stays on the software de-tile. */
 static int g_gpu_failed;
 
-/* Surfaces holding an unreaped write fence. Two things need them:
+/* Each context tracks its own surfaces holding an unreaped write fence
+ * (ctx->fenced, sized from the capture pool). Two things need them:
  *
  *  - teardown (capture renegotiation, decode reset, context destroy), which
  *    must reap them all before the decoder's buffers go away;
@@ -153,15 +154,11 @@ static int g_gpu_failed;
  *    fully read", so the set of unreaped fences is exactly the set of
  *    surfaces that may still be reading a capture slot.
  *
- * The bound is the number of capture slots (one unreaped fence per slot in
- * use, reaped when that slot is re-queued), so size it from the slot count
- * and not from "one job at a time" - jobs are serialised but fences linger.
- * AV1 asks for V4L2SL_NUM_CAPTURE_BUFS_AV1 (40) slots, which is why a fixed 32
- * would silently drop entries. */
-#define GPU_FENCED_MAX V4L2SL_MAX_CAPTURE_BUFS
-static struct v4l2sl_surface *g_fenced[GPU_FENCED_MAX];
-static int g_fenced_overflow_warned;
-
+ * Per context: one unreaped fence per slot in use, reaped when that slot is
+ * re-queued, so the count is bounded by the context's own pool and overflow
+ * is impossible. A process-global table of the same size was shared across
+ * contexts and dropped fences under two streams (2 x 24 = 48 > 40), letting
+ * the decoder re-queue a slot the GPU was still reading (torn Y plane). */
 /* Take the pending fence away from a surface so exactly one owner can close
  * it. Caller holds g_gpu_lock; this is the only place the field is cleared,
  * which is what makes the close safe against the pull thread racing the GL
@@ -169,34 +166,37 @@ static int g_fenced_overflow_warned;
 static int gpu_take_fence_locked(struct v4l2sl_surface *s)
 {
     int fd = s->gpu_fence_fd;
+    struct v4l2sl_context *ctx = s->capture_owner;
 
     s->gpu_fence_fd = -1;
-    for (int i = 0; i < GPU_FENCED_MAX; i++)
-        if (g_fenced[i] == s)
-            g_fenced[i] = NULL;
+    if (ctx)
+        for (int i = 0; i < V4L2SL_MAX_CAPTURE_BUFS; i++)
+            if (ctx->fenced[i] == s)
+                ctx->fenced[i] = NULL;
     /* fd 0-2 means a zeroed/partial surface struct: never close those. */
     return fd > 2 ? fd : -1;
 }
 
 static void gpu_track_fenced_locked(struct v4l2sl_surface *s)
 {
-    for (int i = 0; i < GPU_FENCED_MAX; i++) {
-        if (g_fenced[i] == s)
+    struct v4l2sl_context *ctx = s->capture_owner;
+
+    if (!ctx)
+        return;
+    for (int i = 0; i < V4L2SL_MAX_CAPTURE_BUFS; i++) {
+        if (ctx->fenced[i] == s)
             return;
-    }
-    for (int i = 0; i < GPU_FENCED_MAX; i++) {
-        if (!g_fenced[i]) {
-            g_fenced[i] = s;
+        if (!ctx->fenced[i]) {
+            ctx->fenced[i] = s;
             return;
         }
     }
-    /* Cannot happen while the table is sized from the capture-slot count;
-     * if it ever does, say so instead of losing a fence that teardown needs. */
-    if (!g_fenced_overflow_warned) {
-        g_fenced_overflow_warned = 1;
-        fprintf(stderr, "v4l2stateless: gpu: fence table full (%d); teardown "
-                        "may not reap every fence\n", GPU_FENCED_MAX);
-    }
+    /* Cannot happen: the tracked fences are bounded by this context's own
+     * capture pool, which is what the table is sized from. If it ever does,
+     * say so every time instead of losing a fence that teardown needs. */
+    fprintf(stderr, "v4l2stateless: gpu: fence table full (%d); a fence "
+                    "will not be reaped on teardown\n",
+            V4L2SL_MAX_CAPTURE_BUFS);
 }
 
 static void gpu_poll_close(int fd, const char *what)
@@ -612,23 +612,22 @@ static int gpu_publish_write_fence(struct v4l2sl_surface *s, int bo_fd,
 /* Called before a capture slot goes back to the decoder: if a GPU job is
  * still reading it, wait for that job. Cheap when the job already finished
  * (poll on a signalled fence). */
-void v4l2sl_gpu_wait_capture(int fd, int buf_index)
+void v4l2sl_gpu_wait_capture(struct v4l2sl_context *ctx, int buf_index)
 {
-    struct v4l2sl_surface *hit[GPU_FENCED_MAX];
+    struct v4l2sl_surface *hit[V4L2SL_MAX_CAPTURE_BUFS];
     int n = 0;
 
-    if (fd < 0 || buf_index < 0)
+    if (!ctx || buf_index < 0)
         return;
     pthread_mutex_lock(&g_gpu_lock);
-    for (int i = 0; i < GPU_FENCED_MAX; i++) {
-        struct v4l2sl_surface *s = g_fenced[i];
+    for (int i = 0; i < V4L2SL_MAX_CAPTURE_BUFS; i++) {
+        struct v4l2sl_surface *s = ctx->fenced[i];
 
-        /* Capture slot numbers are per decode context, so match the context
-         * as well: two contexts both have a slot N, and keying on the index
-         * alone let one context reap the other's fence while its own job was
+        /* The table is per context, so the slot index alone is unique: two
+         * contexts both have a slot N, and a shared table keying on the
+         * index let one context reap the other's fence while its own job was
          * still reading the buffer. */
-        if (s && s->buf_index == buf_index && s->capture_owner &&
-            s->capture_owner->v4l2_fd == fd)
+        if (s && s->buf_index == buf_index)
             hit[n++] = s;
     }
     pthread_mutex_unlock(&g_gpu_lock);
@@ -651,23 +650,25 @@ void v4l2sl_gpu_wait_surface(struct v4l2sl_surface *s)
 
 /* Reap every outstanding write fence. Called when the decoder's buffers are
  * about to be freed or renegotiated: the GPU may still be reading them. */
-void v4l2sl_gpu_wait_pending(void)
+void v4l2sl_gpu_wait_pending(struct v4l2sl_context *ctx)
 {
-    struct v4l2sl_surface *pending[GPU_FENCED_MAX];
+    struct v4l2sl_surface *pending[V4L2SL_MAX_CAPTURE_BUFS];
     int n = 0;
 
+    if (!ctx)
+        return;
     pthread_mutex_lock(&g_gpu_lock);
-    for (int i = 0; i < GPU_FENCED_MAX; i++) {
-        pending[i] = g_fenced[i];
-        g_fenced[i] = NULL;
+    for (int i = 0; i < V4L2SL_MAX_CAPTURE_BUFS; i++) {
+        pending[i] = ctx->fenced[i];
+        ctx->fenced[i] = NULL;
     }
     pthread_mutex_unlock(&g_gpu_lock);
-    for (int i = 0; i < GPU_FENCED_MAX; i++)
+    for (int i = 0; i < V4L2SL_MAX_CAPTURE_BUFS; i++)
         if (pending[i])
             n++;
     if (!n)
         return;
-    for (int i = 0; i < GPU_FENCED_MAX; i++)
+    for (int i = 0; i < V4L2SL_MAX_CAPTURE_BUFS; i++)
         if (pending[i]) {
             int fd;
 

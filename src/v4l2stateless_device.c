@@ -347,7 +347,7 @@ void v4l2sl_release_context_device(struct v4l2sl_context *ctx)
         return;
 
     v4l2sl_gbm_detile_wait();
-    v4l2sl_gpu_wait_pending();
+    v4l2sl_gpu_wait_pending(ctx);
     v4l2sl_gpu_forget_capture(ctx);
 
     /* Persistent M2M queues hold V4L2 MMAP mappings — release them while
@@ -455,7 +455,7 @@ static void rebuild_free_pools(struct v4l2sl_context *ctx)
 void v4l2sl_decode_reset(struct v4l2sl_context *ctx)
 {
     v4l2sl_gbm_detile_wait();   /* capture slots are about to be recycled */
-    v4l2sl_gpu_wait_pending();  /* ... and the GPU may still be reading them */
+    v4l2sl_gpu_wait_pending(ctx);  /* ... and the GPU may still be reading them */
     if (!ctx || ctx->v4l2_fd < 0)
         return;
 
@@ -673,7 +673,7 @@ static int decode_submit_inner(struct v4l2sl_context *ctx, int out_buf_idx,
 
     /* Capture is queued bare: the stateless decoder spec forbids CAPTURE
      * buffers in a request (vb2 answers EPERM for them). */
-    if (v4l2sl_queue_capture(ctx->v4l2_fd, cap_buf_idx, ctx->request_fd) < 0) {
+    if (v4l2sl_queue_capture(ctx, cap_buf_idx, ctx->request_fd) < 0) {
         fprintf(stderr, "v4l2stateless: QBUF capture[%d] failed\n", cap_buf_idx);
         v4l2sl_cap_pool_push(ctx, cap_buf_idx);
         /* Recover the bitstream buffer so the pool does not leak. */
@@ -889,7 +889,7 @@ int v4l2sl_ensure_capture(struct v4l2sl_context *ctx, int width, int height,
     }
 
     v4l2sl_gbm_detile_wait();   /* pending de-tile reads a capture slot */
-    v4l2sl_gpu_wait_pending();  /* ... and the GPU may still read it */
+    v4l2sl_gpu_wait_pending(ctx);  /* ... and the GPU may still read it */
     v4l2sl_gpu_forget_capture(ctx);  /* the pool's dma-bufs die below */
     release_ctx_capture_surfaces(ctx);
     v4l2sl_unmap_capture_buffers(ctx);
@@ -1257,8 +1257,10 @@ int v4l2sl_queue_output(struct v4l2sl_context *ctx, int buf_index,
 /*
  * Queue a capture buffer (decoded frame output)
  */
-int v4l2sl_queue_capture(int fd, int buf_index, int request_fd)
+int v4l2sl_queue_capture(struct v4l2sl_context *ctx, int buf_index,
+                         int request_fd)
 {
+    int fd = ctx->v4l2_fd;
     struct v4l2_buffer buf = { 0 };
     struct v4l2_plane planes[VIDEO_MAX_PLANES] = { 0 };
 
@@ -1295,7 +1297,7 @@ int v4l2sl_queue_capture(int fd, int buf_index, int request_fd)
     /* The GPU de-tile reads this capture slot through dma-bufs after the
      * worker thread has returned; the decoder must not refill it yet. */
     if (v4l2sl_detile_mode() == V4L2SL_DETILE_GPU)
-        v4l2sl_gpu_wait_capture(fd, buf_index);
+        v4l2sl_gpu_wait_capture(ctx, buf_index);
 
     if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
         fprintf(stderr, "v4l2stateless: QBUF capture[%d] failed: %s\n", buf_index, strerror(errno));
