@@ -244,6 +244,83 @@ v4l2sl_terminate(VADriverContextP ctx)
     return VA_STATUS_SUCCESS;
 }
 
+/*
+ * What the capture queue actually offers, per codec device.
+ *
+ * The profile table is static, but not every device can serve every profile in
+ * it: MT8183/VDPU381 is H.264 8-bit only and offers a single capture format
+ * (MM21), so advertising High10 or High422 gives a client a context that dies
+ * mid-stream ("decode translate failed", DQBUF ERROR) instead of an up-front
+ * refusal. Ask the driver with ENUM_FMT rather than assuming, and cache the
+ * answer for the session.
+ */
+static struct {
+    int probed;
+    int ten_bit;    /* device offers a 10-bit capture format */
+    int yuv422;     /* device offers a 4:2:2 capture format */
+} g_capture_caps[V4L2SL_CODEC_VPP + 1];
+
+static void probe_capture_caps(struct v4l2sl_driver_data *dd,
+                               enum v4l2sl_codec codec)
+{
+    const char *path = cached_device(dd, codec);
+    struct v4l2_fmtdesc f = { 0 };
+    int fd;
+
+    if (codec > V4L2SL_CODEC_VPP || g_capture_caps[codec].probed)
+        return;
+    g_capture_caps[codec].probed = 1;
+    if (!path)
+        return;
+    fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+        return;
+    f.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    while (ioctl(fd, VIDIOC_ENUM_FMT, &f) == 0) {
+        switch (f.pixelformat) {
+        case V4L2_PIX_FMT_NV15:      /* packed 10-bit 4:2:0 */
+        case V4L2_PIX_FMT_P010:      /* 10-bit in the high half of 16 */
+            g_capture_caps[codec].ten_bit = 1;
+            break;
+        case V4L2_PIX_FMT_NV20:      /* packed 10-bit 4:2:2 */
+            g_capture_caps[codec].ten_bit = 1;
+            g_capture_caps[codec].yuv422 = 1;
+            break;
+        case V4L2_PIX_FMT_NV16:      /* 8-bit 4:2:2 */
+            g_capture_caps[codec].yuv422 = 1;
+            break;
+        default:
+            break;
+        }
+        f.index++;
+    }
+    close(fd);
+    if (v4l2sl_debug)
+        fprintf(stderr, "v4l2stateless: capture caps %d: 10bit=%d 422=%d\n",
+                (int)codec, g_capture_caps[codec].ten_bit,
+                g_capture_caps[codec].yuv422);
+}
+
+/* True when this profile's RT format can be delivered by that device. */
+static int profile_supported_by_capture(enum v4l2sl_codec codec,
+                                        VAProfile profile)
+{
+    for (unsigned i = 0; i < sizeof(profile_rt_formats) /
+                                sizeof(profile_rt_formats[0]); i++) {
+        if (profile_rt_formats[i].profile != profile)
+            continue;
+        if ((profile_rt_formats[i].rt_format &
+             (VA_RT_FORMAT_YUV420_10 | VA_RT_FORMAT_YUV422_10)) &&
+            !g_capture_caps[codec].ten_bit)
+            return 0;
+        if ((profile_rt_formats[i].rt_format & VA_RT_FORMAT_YUV422) &&
+            !g_capture_caps[codec].yuv422)
+            return 0;
+        return 1;
+    }
+    return 1;
+}
+
 static VAStatus
 v4l2sl_query_config_profiles(VADriverContextP ctx,
                              VAProfile *profiles,
@@ -275,6 +352,19 @@ v4l2sl_query_config_profiles(VADriverContextP ctx,
             continue;
         if (!cached_device(driver_data, codec))
             continue;
+        /* VAProfileNone is the VPP config: its formats are negotiated on the
+         * m2m node, not on a decoder capture queue. */
+        if (v4l2sl_profiles[i] != VAProfileNone) {
+            probe_capture_caps(driver_data, codec);
+            if (!profile_supported_by_capture(codec, v4l2sl_profiles[i])) {
+                if (v4l2sl_debug)
+                    fprintf(stderr,
+                            "v4l2stateless: profile %d not advertised: the "
+                            "device offers no matching capture format\n",
+                            (int)v4l2sl_profiles[i]);
+                continue;
+            }
+        }
         if (count < cap)
             profiles[count] = v4l2sl_profiles[i];
         count++;
@@ -2010,6 +2100,7 @@ v4l2sl_create_image(VADriverContextP ctx, VAImageFormat *format,
 
     return VA_STATUS_SUCCESS;
 }
+
 
 static VAStatus
 v4l2sl_get_image(VADriverContextP ctx, VASurfaceID surface,
