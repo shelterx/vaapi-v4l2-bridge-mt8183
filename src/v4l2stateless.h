@@ -111,7 +111,8 @@ struct v4l2sl_surface {
     uint32_t bo_uv_rows;     /* Y rows before the UV plane inside gbm_bo.
                               * visible height for the software de-tile, the
                               * aligned capture height when MDP3 writes it. */
-    int expbuf_fd;           /* VIDIOC_EXPBUF of capture, -1 if none (experiment) */
+    int expbuf_fd;           /* cached VIDIOC_EXPBUF fd for the exported image,
+                              * -1 when the surface is not exported */
     int gpu_fence_fd;        /* pending GPU write fence for gbm_bo (GPU de-tile),
                               * -1 when the bo is idle. Only the CPU-readback
                               * paths wait on it: GPU consumers are ordered
@@ -257,12 +258,6 @@ struct v4l2sl_context {
      * and de-tiled from this second pointer. NULL for single-plane formats. */
     void *capture_uv_ptr[V4L2SL_MAX_CAPTURE_BUFS];
     uint32_t capture_uv_size;
-    /* DMABUF-allocated capture: per-buffer dma-buf fds (Y / UV), set when the
-     * capture queue is allocated with V4L2_MEMORY_DMABUF so a frame can be
-     * imported into the MDP3 m2m de-tiler (zero-copy). -1 = not available. */
-    int capture_buf_fd[V4L2SL_MAX_CAPTURE_BUFS];
-    int capture_uv_fd[V4L2SL_MAX_CAPTURE_BUFS];
-    int capture_dmabuf;   /* capture queue allocated as DMABUF */
     int capture_buf_anon; /* calloc stub when ioctl hook is installed */
     int free_cap_bufs[V4L2SL_MAX_CAPTURE_BUFS];
     int n_free_cap;
@@ -415,7 +410,6 @@ int v4l2sl_open_device(const char *path);
 int v4l2sl_open_media_for_device(const char *video_path);
 int v4l2sl_request_alloc(int media_fd);
 int v4l2sl_setup_output_queue(int fd, uint32_t codec_format, int width, int height);
-int v4l2sl_setup_capture_queue(int fd, int width, int height, uint32_t pixelformat);
 int v4l2sl_setup_capture_queue_count(int fd, int width, int height,
                                      uint32_t pixelformat, int count);
 int v4l2sl_streamon(int fd, enum v4l2_buf_type type);
@@ -486,12 +480,6 @@ double v4l2sl_gbm_detile_last_wait_ms(void);
 void v4l2sl_gbm_detile_last_job(double *wall_ms, double *cpu_ms);
 /* True when the pending job is reading this surface's capture slot. */
 int v4l2sl_gbm_detile_pending_for(const struct v4l2sl_surface *s);
-/* Map the bo for writing (HW de-tile writes NV12 into it); unmap when done.
- * Returns the mapped Y pointer (NULL on failure); *out_stride / *out_data
- * receive the bo stride and the unmap handle. */
-void *v4l2sl_gbm_surface_map(struct v4l2sl_surface *s, uint32_t w, uint32_t h,
-                            uint32_t *out_stride, void **out_data);
-void v4l2sl_gbm_surface_unmap(struct v4l2sl_surface *s, void *ptr, void *data);
 /* Lazy memfd: refill the memfd snapshot from the bo when a CPU-readback
  * caller (vaGetImage / vaDeriveImage / VPP source) needs it after a
  * bo-only pull_capture. */

@@ -230,15 +230,9 @@ int v4l2sl_setup_output_queue(int fd, uint32_t codec_format, int width, int heig
 }
 
 /*
- * Setup capture queue (decoded frames output)
- * Returns 0 on success, -1 on error
+ * Setup the capture (decoded frames) queue with `count` buffers; returns the
+ * number the driver granted, or -1 on error.
  */
-int v4l2sl_setup_capture_queue(int fd, int width, int height, uint32_t pixelformat)
-{
-    return v4l2sl_setup_capture_queue_count(fd, width, height, pixelformat,
-                                            V4L2SL_NUM_CAPTURE_BUFS);
-}
-
 int v4l2sl_setup_capture_queue_count(int fd, int width, int height,
                                      uint32_t pixelformat, int count)
 {
