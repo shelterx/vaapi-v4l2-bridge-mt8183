@@ -231,6 +231,13 @@ v4l2sl_terminate(VADriverContextP ctx)
     }
     pthread_mutex_unlock(&g_v4l2sl_lock);
 
+    /* Every context and surface is gone, so nothing can start another GPU
+     * job: join the GL thread and let it delete its EGL/GL state. Without
+     * this the thread, its private EGLDisplay and every cached EGLImage
+     * outlive vaTerminate (they were only reclaimed at process exit). */
+    v4l2sl_gbm_detile_wait();
+    v4l2sl_gpu_fini();
+
     free(driver_data);
     ctx->pDriverData = NULL;
 

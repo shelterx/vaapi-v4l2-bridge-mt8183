@@ -715,6 +715,7 @@ static struct {
     pthread_cond_t done;
     int started;
     int quit;
+    int stopping;           /* fini is running: refuse new jobs */
     int posted;
     int finished;
     int rc;
@@ -729,9 +730,65 @@ static struct {
     .uv_fd = -1,
 };
 
+/*
+ * Delete every GL object and the EGL display. GL thread only, with the
+ * context current: deleting from any other thread fails with EGL_BAD_ACCESS
+ * and the glDelete* calls then silently do nothing, leaking the objects.
+ * Called with g_req.lock released, on the way out of gpu_thread_main().
+ */
+static void gpu_teardown_gl(void)
+{
+    pthread_mutex_lock(&g_gpu_lock);
+    if (g_gpu.dpy == EGL_NO_DISPLAY) {
+        pthread_mutex_unlock(&g_gpu_lock);
+        return;
+    }
+    for (int i = 0; i < DST_ENTRIES; i++) {
+        struct dst_entry *e = &g_gpu.dst[i];
+
+        if (e->fbo)
+            glDeleteFramebuffers(1, &e->fbo);
+        if (e->tex)
+            glDeleteTextures(1, &e->tex);
+        if (e->img != EGL_NO_IMAGE_KHR)
+            g_destroy_image(g_gpu.dpy, e->img);
+        memset(e, 0, sizeof(*e));
+    }
+    for (int i = 0; i < SRC_ENTRIES; i++) {
+        struct src_entry *e = &g_gpu.src[i];
+
+        if (e->tex)
+            glDeleteTextures(1, &e->tex);
+        if (e->img != EGL_NO_IMAGE_KHR)
+            g_destroy_image(g_gpu.dpy, e->img);
+        memset(e, 0, sizeof(*e));
+        e->buf_index = -1;
+        e->plane = -1;
+    }
+    if (g_gpu.vao)
+        glDeleteVertexArrays(1, &g_gpu.vao);
+    if (g_gpu.prog)
+        glDeleteProgram(g_gpu.prog);
+    eglMakeCurrent(g_gpu.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    if (g_gpu.ctx != EGL_NO_CONTEXT)
+        eglDestroyContext(g_gpu.dpy, g_gpu.ctx);
+    if (g_gpu.surf != EGL_NO_SURFACE)
+        eglDestroySurface(g_gpu.dpy, g_gpu.surf);
+    eglTerminate(g_gpu.dpy);
+    memset(&g_gpu, 0, sizeof(g_gpu));
+    g_gpu_failed = 0;
+    pthread_mutex_unlock(&g_gpu_lock);
+    if (getenv("V4L2SL_PROFILE"))
+        fprintf(stderr, "v4l2stateless: gpu: teardown done (GL objects, "
+                        "EGL display released)\n");
+}
+
 static void *gpu_thread_main(void *arg)
 {
     (void)arg;
+    /* Named so it is identifiable in top/gdb and so teardown can be checked
+     * for (the Mesa threads EGL starts have their own names). */
+    pthread_setname_np(pthread_self(), "v4l2sl-gpu");
     pthread_mutex_lock(&g_req.lock);
     for (;;) {
         while (!g_req.posted && !g_req.quit)
@@ -748,6 +805,9 @@ static void *gpu_thread_main(void *arg)
         pthread_cond_signal(&g_req.done);
     }
     pthread_mutex_unlock(&g_req.lock);
+    /* The context is current on this thread, so this is the only place the
+     * GL objects can actually be deleted. */
+    gpu_teardown_gl();
     return NULL;
 }
 
@@ -759,6 +819,11 @@ int v4l2sl_gpu_detile(struct v4l2sl_surface *s, int y_fd, int uv_fd)
         goto fail;
 
     pthread_mutex_lock(&g_req.lock);
+    if (g_req.stopping) {
+        /* fini is joining the thread: a job posted now would never run. */
+        pthread_mutex_unlock(&g_req.lock);
+        goto fail;
+    }
     if (!g_req.started) {
         if (pthread_create(&g_req.th, NULL, gpu_thread_main, NULL) != 0) {
             int r;
@@ -964,54 +1029,28 @@ void v4l2sl_gpu_forget_capture(struct v4l2sl_context *ctx)
 
 void v4l2sl_gpu_fini(void)
 {
+    /* Stop the GL thread; it deletes its own GL objects and EGL display on
+     * the way out (see gpu_teardown_gl). `stopping` keeps a caller that is
+     * already inside gpu_detile() from posting a job nobody will run. */
     pthread_mutex_lock(&g_req.lock);
     if (g_req.started) {
+        g_req.stopping = 1;
         g_req.quit = 1;
         pthread_cond_signal(&g_req.work);
         pthread_mutex_unlock(&g_req.lock);
         pthread_join(g_req.th, NULL);
+        pthread_mutex_lock(&g_req.lock);
         g_req.started = 0;
         g_req.quit = 0;
-    } else {
-        pthread_mutex_unlock(&g_req.lock);
+        g_req.stopping = 0;
     }
+    pthread_mutex_unlock(&g_req.lock);
+
+    /* Fences are per context now and every context reaped its own on the way
+     * out (v4l2sl_gpu_wait_pending(ctx) in release_context_device), so there
+     * is nothing to poll here. */
     pthread_mutex_lock(&g_gpu_lock);
-    for (int i = 0; i < DST_ENTRIES; i++) {
-        struct dst_entry *e = &g_gpu.dst[i];
-
-        if (e->fbo)
-            glDeleteFramebuffers(1, &e->fbo);
-        if (e->tex)
-            glDeleteTextures(1, &e->tex);
-        if (e->img != EGL_NO_IMAGE_KHR && g_gpu.dpy != EGL_NO_DISPLAY)
-            g_destroy_image(g_gpu.dpy, e->img);
-        memset(e, 0, sizeof(*e));
-    }
-    for (int i = 0; i < SRC_ENTRIES; i++) {
-        struct src_entry *e = &g_gpu.src[i];
-
-        if (e->tex)
-            glDeleteTextures(1, &e->tex);
-        if (e->img != EGL_NO_IMAGE_KHR && g_gpu.dpy != EGL_NO_DISPLAY)
-            g_destroy_image(g_gpu.dpy, e->img);
-        memset(e, 0, sizeof(*e));
-    }
-    if (g_gpu.state > 0 && g_gpu.dpy != EGL_NO_DISPLAY) {
-        /* The GL thread has been joined, but if the context is still current
-         * somewhere eglMakeCurrent() fails with EGL_BAD_ACCESS and the
-         * deletes below would be no-ops. Nothing better is possible here. */
-        eglMakeCurrent(g_gpu.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                       EGL_NO_CONTEXT);
-        if (g_gpu.vao)
-            glDeleteVertexArrays(1, &g_gpu.vao);
-        if (g_gpu.prog)
-            glDeleteProgram(g_gpu.prog);
-        if (g_gpu.ctx != EGL_NO_CONTEXT)
-            eglDestroyContext(g_gpu.dpy, g_gpu.ctx);
-        if (g_gpu.surf != EGL_NO_SURFACE)
-            eglDestroySurface(g_gpu.dpy, g_gpu.surf);
-        eglTerminate(g_gpu.dpy);
-    }
     memset(&g_gpu, 0, sizeof(g_gpu));
+    g_gpu_failed = 0;
     pthread_mutex_unlock(&g_gpu_lock);
 }
