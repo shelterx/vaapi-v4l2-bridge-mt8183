@@ -1505,13 +1505,21 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
          */
         if (surf->gbm_bo && !ctx->mdp3.disabled &&
             v4l2sl_detile_mode() == V4L2SL_DETILE_GPU) {
-            /* GPU de-tile: same dma-buf handoff as MDP3, different engine. */
-            int y_fd = v4l2sl_capture_expbuf_plane(ctx, buf_index, 0);
-            int uv_fd = y_fd >= 0
-                            ? v4l2sl_capture_expbuf_plane(ctx, buf_index, 1)
-                            : -1;
+            /*
+             * GPU de-tile: same dma-buf handoff as MDP3, different engine.
+             * The shader caches one EGLImage per (slot, plane), so the planes
+             * only have to be exported when that cache misses - otherwise this
+             * is two EXPBUF ioctls and four fd operations per frame for
+             * dma-bufs the GL side already holds.
+             */
+            int cached = v4l2sl_gpu_sources_ready(ctx, buf_index, stride, alh);
+            int y_fd = cached ? -1 : v4l2sl_capture_expbuf_plane(ctx, buf_index, 0);
+            int uv_fd = cached ? -1
+                               : (y_fd >= 0
+                                      ? v4l2sl_capture_expbuf_plane(ctx, buf_index, 1)
+                                      : -1);
 
-            if (uv_fd >= 0) {
+            if (cached || uv_fd >= 0) {
                 if (v4l2sl_gbm_detile_async_wanted()) {
                     if (v4l2sl_gbm_detile_async_hw(ctx, surf, y_fd,
                                                    uv_fd) == 0) {

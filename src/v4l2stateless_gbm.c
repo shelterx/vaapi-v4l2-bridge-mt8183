@@ -435,13 +435,14 @@ int v4l2sl_gbm_detile_pending_for(const struct v4l2sl_surface *s)
 
 /* Hardware variant: the caller has already EXPBUF'd the decoder capture
  * planes, so the worker only talks to the MDP3 device (never the decoder fd).
- * Takes ownership of both fds. */
+ * Takes ownership of both fds. -1/-1 means the GL side already holds the
+ * planes for this slot (cache hit) and no fds should be exported. */
 int v4l2sl_gbm_detile_async_hw(struct v4l2sl_context *ctx,
                                struct v4l2sl_surface *s, int y_fd, int uv_fd)
 {
     int rc;
 
-    if (!ctx || !s || !s->gbm_bo || y_fd < 0 || uv_fd < 0)
+    if (!ctx || !s || !s->gbm_bo || (y_fd < 0) != (uv_fd < 0))
         return -1;
     pthread_mutex_lock(&g_adetile_lock);
     detile_join_locked();

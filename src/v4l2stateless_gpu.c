@@ -504,7 +504,7 @@ static GLuint gpu_src_texture(struct v4l2sl_context *ctx, int buf_index,
 {
     struct src_entry *e = NULL;
 
-    if (!ctx || buf_index < 0 || fd < 0)
+    if (!ctx || buf_index < 0)
         return 0;
     for (int i = 0; i < SRC_ENTRIES; i++) {
         struct src_entry *c = &g_gpu.src[i];
@@ -516,6 +516,10 @@ static GLuint gpu_src_texture(struct v4l2sl_context *ctx, int buf_index,
         }
     }
     if (!e) {
+        /* A miss needs the plane's dma-buf; the caller only exports it then
+         * (otherwise this is 2 EXPBUF ioctls per frame for images it has). */
+        if (fd < 0)
+            return 0;
         /* Reuse the next slot; we are on the GL thread with the context
          * current, so its old objects can be deleted immediately. */
         e = &g_gpu.src[g_gpu.src_next];
@@ -815,7 +819,10 @@ int v4l2sl_gpu_detile(struct v4l2sl_surface *s, int y_fd, int uv_fd)
 {
     int rc;
 
-    if (!s || !s->gbm_bo || y_fd < 0 || uv_fd < 0)
+    /* -1/-1 means both planes are already imported for this slot: there is
+     * nothing to export and the caller owns no fds. */
+    if (!s || !s->gbm_bo || y_fd < -1 || uv_fd < -1 ||
+        (y_fd < 0) != (uv_fd < 0))
         goto fail;
 
     pthread_mutex_lock(&g_req.lock);
@@ -852,8 +859,10 @@ int v4l2sl_gpu_detile(struct v4l2sl_surface *s, int y_fd, int uv_fd)
         pthread_cond_wait(&g_req.done, &g_req.lock);
     rc = g_req.rc;
     pthread_mutex_unlock(&g_req.lock);
-    close(y_fd);
-    close(uv_fd);
+    if (y_fd >= 0)
+        close(y_fd);
+    if (uv_fd >= 0)
+        close(uv_fd);
     /* A/B escape hatch: block here (not in the GL thread, which holds the
      * lock) to reproduce the pre-pipelined handoff. */
     if (getenv("V4L2SL_GPU_WAIT"))
@@ -885,7 +894,8 @@ static int gpu_job(struct v4l2sl_surface *s, int y_fd, int uv_fd)
     double wait_ms = 0.0;
     double t0, t_makecur = 0.0, t_import = 0.0, t_draw = 0.0;
 
-    if (!s || !s->gbm_bo || y_fd < 0 || uv_fd < 0)
+    if (!s || !s->gbm_bo || y_fd < -1 || uv_fd < -1 ||
+        (y_fd < 0) != (uv_fd < 0))
         goto out;
     cap_stride = s->stride;
     ah = s->bo_uv_rows ? s->bo_uv_rows : s->aligned_h;
@@ -987,6 +997,40 @@ out:
                 (ts.tv_sec * 1e3 + ts.tv_nsec / 1e6) - t0c);
     }
     return rc;
+}
+
+/*
+ * True when both source planes of this capture slot are already imported for
+ * the expected tile geometry, so the caller can skip EXPBUF for the frame.
+ * Same key as gpu_src_texture() - (ctx, buf_index, plane, tiles) - and a
+ * capture renegotiation tombstones the entries via
+ * v4l2sl_gpu_forget_capture(), so a hit means the dma-bufs are unchanged.
+ */
+int v4l2sl_gpu_sources_ready(struct v4l2sl_context *ctx, int buf_index,
+                             uint32_t stride, uint32_t aligned_h)
+{
+    uint32_t tiles;
+    int found = 0;
+
+    if (!ctx || buf_index < 0 || !stride || !aligned_h ||
+        stride % 16 || aligned_h % 32)
+        return 0;
+    tiles = (stride / 16) * (aligned_h / 32);
+    pthread_mutex_lock(&g_gpu_lock);
+    for (int plane = 0; plane < 2; plane++) {
+        for (int i = 0; i < SRC_ENTRIES; i++) {
+            struct src_entry *e = &g_gpu.src[i];
+
+            if (e->ctx == ctx && e->buf_index == buf_index &&
+                e->plane == plane && e->tiles == tiles && e->tex &&
+                e->img != EGL_NO_IMAGE_KHR) {
+                found++;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_gpu_lock);
+    return found == 2;
 }
 
 void v4l2sl_gpu_forget_bo(struct gbm_bo *bo)

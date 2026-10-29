@@ -563,6 +563,10 @@ void v4l2sl_gpu_forget_bo(struct gbm_bo *bo);
  * being freed (context release, capture renegotiation). A decode reset keeps
  * the pool and must not call this. */
 void v4l2sl_gpu_forget_capture(struct v4l2sl_context *ctx);
+/* True when both source planes of a capture slot are already imported, so the
+ * caller can skip EXPBUF for this frame (GPU de-tile). */
+int v4l2sl_gpu_sources_ready(struct v4l2sl_context *ctx, int buf_index,
+                             uint32_t stride, uint32_t aligned_h);
 void v4l2sl_gpu_fini(void);
 /* One-pass decode-buffer collection shared by every codec translate. */
 void v4l2sl_collect_decode_buffers(struct v4l2sl_buffer **buffers, int n,
