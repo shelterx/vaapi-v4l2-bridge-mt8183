@@ -1,7 +1,8 @@
 /*
- * VPP via rockchip RGA (/dev/video0): scale, CSC, rotate, flip.
- * Stateful M2M. Filters the kernel does not expose (denoise, deinterlace)
- * are reported as unsupported.
+ * VPP through a V4L2 m2m device: scale, CSC, rotate, flip. Stateful M2M, so
+ * it works with any node that exposes those controls — on MT8183 that is the
+ * MDP3 m2m node (/dev/video0), not a Rockchip RGA. Filters the kernel does not
+ * expose (denoise, deinterlace) are reported as unsupported.
  */
 
 #include <stdio.h>
@@ -61,7 +62,7 @@ static const VAProcColorStandardType vpp_color_out[] = {
 
 VAStatus v4l2sl_vpp_query_filters(VAProcFilterType *filters, unsigned int *n)
 {
-    /* RGA has rotate/flip as controls, not VAProcFilter* types. */
+    /* The m2m node takes rotate/flip as controls, not VAProcFilter* types. */
     if (!n)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     (void)filters;
@@ -107,7 +108,7 @@ VAStatus v4l2sl_vpp_query_pipeline_caps(VAProcPipelineCaps *caps)
 }
 
 /* Row copies against a pre-mapped V4L2 plane (rows packed at width*bpp,
- * matching what RGA negotiates for these formats). */
+ * the layout the node negotiates for these formats). */
 static void copy_rows_to(void *dst, const uint8_t *cpu, uint32_t cpu_stride,
                          int width, int height_rows, int bpp)
 {
@@ -198,7 +199,7 @@ VAStatus v4l2sl_vpp_run(struct v4l2sl_context *ctx,
     src_fcc = src->format ? src->format : VA_FOURCC_NV12;
     dst_fcc = dst->format ? dst->format : VA_FOURCC_NV12;
     if (src_fcc == VA_FOURCC_P010)
-        src_fcc = VA_FOURCC_NV12; /* RGA has no 10-bit; caller should convert */
+        src_fcc = VA_FOURCC_NV12; /* no 10-bit path here; caller should convert */
     bpp_src = (src_fcc == VA_FOURCC_YUY2) ? 2 :
               (src_fcc == VA_FOURCC_ARGB || src_fcc == VA_FOURCC_BGRA ||
                src_fcc == VA_FOURCC_BGRX) ? 4 : 1;

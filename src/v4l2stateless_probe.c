@@ -266,7 +266,7 @@ static int node_has_coded_output(const struct scan_node *nd)
 
 /* Shared walk over /dev/video0..63: every M2M_MPLANE node that offers at
  * least one OUTPUT or CAPTURE format (unified accept criteria), carrying
- * its fourcc lists plus the JPEG-encoder / RGA markers callers filter on.
+ * its fourcc lists plus the JPEG-encoder / VPP markers callers filter on.
  * Returns the node count. */
 static int scan_nodes(struct scan_node *nodes, int max_nodes,
                       const struct v4l2sl_disable *dis)
@@ -539,7 +539,7 @@ static void probe_cache_store(const char *path, const char *boot,
 }
 
 /* Single pass over /dev/video*: decoders by OUTPUT fourcc (skipping JPEG
- * capture nodes), plus the JPEG encoder and RGA VPP nodes. */
+ * capture nodes), plus the JPEG encoder and VPP m2m nodes. */
 static int scan_all_uncached(char *h264_out, char *hevc_out, char *av1_out,
                              char *vp8_out, char *mpeg2_out,
                              char *jpeg_enc_out, char *vpp_out, unsigned out_len)

@@ -4,7 +4,9 @@
  * Copyright 2026 — MIT License
  *
  * This file implements the libva driver VTable. It translates VA-API calls
- * into V4L2 Request API operations on the RK3588 rkvdec/hantro hardware.
+ * into V4L2 Request API operations on the MT8183 decoder (mtk-vcodec over the
+ * hantro VDPU381, frame-based stateless UAPI). The code is not Rockchip
+ * specific, but nothing here has been verified on rkvdec hardware.
  */
 
 #include <stdio.h>
@@ -135,8 +137,10 @@ static const char *cached_device(struct v4l2sl_driver_data *dd, enum v4l2sl_code
  * VA-API driver VTable implementations
  */
 
-/* rkvdec real per-dimension limit — every max-size advertisement must
- * agree on this (config attrs AND surface attrs). */
+/* Per-dimension limit advertised to clients in the config and surface
+ * attributes; both must agree. MT8183 clamps MM21 capture to 2048x1088, so
+ * this 4096 is a leftover from the driver's rkvdec origins — see the open
+ * question in docs/AGENTS.md before tightening it. */
 #define V4L2SL_MAX_PICTURE_DIM 4096
 
 
@@ -386,7 +390,7 @@ v4l2sl_create_config(VADriverContextP ctx,
     config->device_path = device_path;
 
     /* Parse RT format from attribs. Leave 8-bit NV12 until the first
-     * picture: rkvdec only programs 10-bit/422 after a matching SPS
+     * picture: the driver only programs 10-bit/422 after a matching SPS
      * (HEVC Main10 does NV12 here, then NV15 post-SPS). */
     config->rt_format = VA_RT_FORMAT_YUV420;
     for (int i = 0; i < num_attribs; i++) {
@@ -1010,7 +1014,7 @@ v4l2sl_create_context(VADriverContextP ctx,
         goto fail;
     }
 
-    /* JPEG encode and RGA VPP are stateful M2M — no request API. */
+    /* JPEG encode and VPP are stateful M2M — no request API. */
     if (context->codec == V4L2SL_CODEC_JPEG_ENC ||
         context->codec == V4L2SL_CODEC_VPP) {
         *context_id = ++driver_data->next_context_id;
@@ -1060,7 +1064,7 @@ v4l2sl_create_context(VADriverContextP ctx,
      * pressure). Failing the context outright beats a zombie fd that
      * errors on every frame — ffmpeg/Chrome fall back to software.
      *
-     * H.264 defers capture until the first picture: rkvdec's SPS s_ctrl
+     * H.264 defers capture until the first picture: the SPS control
      * updates image_fmt (8-bit vs NV15) and returns EBUSY if capture
      * buffers already exist. GStreamer REQBUFS(0)s first, then SPS,
      * then NV15. HEVC keeps the create-time queue because its SPS is
@@ -1084,10 +1088,10 @@ v4l2sl_create_context(VADriverContextP ctx,
 
     /*
      * Start streaming on both queues — QBUF is EPERM before this.
-     * HEVC/AV1/MPEG-2 defer STREAMON until the first picture: rkvdec
+     * HEVC/AV1/MPEG-2 defer STREAMON until the first picture: the driver
      * wants the SPS (global) first. H.264 High10 must do the same —
-     * STREAMON on NV12 then renegotiating to NV15 leaves rkvdec
-     * producing empty 10-bit frames.
+     * STREAMON on NV12 then renegotiating to NV15 leaves it producing
+     * empty 10-bit frames.
      */
     if (context->codec != V4L2SL_CODEC_HEVC &&
         context->codec != V4L2SL_CODEC_AV1 &&

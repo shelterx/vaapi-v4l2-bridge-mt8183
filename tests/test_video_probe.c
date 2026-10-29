@@ -54,27 +54,27 @@ static int node_has_fourcc(const char *path, uint32_t want)
 
 static int run_unit(void)
 {
-    static const uint32_t rkvdec[] = {
+    static const uint32_t h264hevc_fmts[] = {
         V4L2_PIX_FMT_HEVC_SLICE, V4L2_PIX_FMT_H264_SLICE
     };
     static const uint32_t av1[] = { V4L2_PIX_FMT_AV1_FRAME };
-    static const uint32_t rga[] = { V4L2_PIX_FMT_NV12 };
+    static const uint32_t nv12_fmts[] = { V4L2_PIX_FMT_NV12 };
     static const uint32_t mpegvp8[] = {
         v4l2_fourcc('M', 'G', '2', 'S'), v4l2_fourcc('V', 'P', '8', 'F')
     };
     struct v4l2sl_node_fmts current[] = {
-        { "/dev/video0", rga, 1, V4L2SL_REQAPI_UNKNOWN },
-        { "/dev/video1", rkvdec, 2, V4L2SL_REQAPI_UNKNOWN },
+        { "/dev/video0", nv12_fmts, 1, V4L2SL_REQAPI_UNKNOWN },
+        { "/dev/video1", h264hevc_fmts, 2, V4L2SL_REQAPI_UNKNOWN },
         { "/dev/video2", mpegvp8, 2, V4L2SL_REQAPI_UNKNOWN },
-        { "/dev/video3", rga, 1, V4L2SL_REQAPI_UNKNOWN },
+        { "/dev/video3", nv12_fmts, 1, V4L2SL_REQAPI_UNKNOWN },
         { "/dev/video4", av1, 1, V4L2SL_REQAPI_UNKNOWN },
     };
     struct v4l2sl_node_fmts swapped[] = {
         { "/dev/video1", av1, 1, V4L2SL_REQAPI_UNKNOWN },
-        { "/dev/video4", rkvdec, 2, V4L2SL_REQAPI_UNKNOWN },
+        { "/dev/video4", h264hevc_fmts, 2, V4L2SL_REQAPI_UNKNOWN },
     };
     struct v4l2sl_node_fmts none[] = {
-        { "/dev/video0", rga, 1, V4L2SL_REQAPI_UNKNOWN },
+        { "/dev/video0", nv12_fmts, 1, V4L2SL_REQAPI_UNKNOWN },
     };
     uint32_t fcc;
     char tag[8];
@@ -117,7 +117,7 @@ static int run_unit(void)
         struct v4l2sl_node_fmts swapped_stub[] = {
             { "/dev/video1", av1, 1, V4L2SL_REQAPI_NO },
             { "/dev/video2", av1, 1, V4L2SL_REQAPI_YES },
-            { "/dev/video4", rkvdec, 2, V4L2SL_REQAPI_YES },
+            { "/dev/video4", h264hevc_fmts, 2, V4L2SL_REQAPI_YES },
         };
         expect_eq(v4l2sl_pick_device_for_codec(V4L2SL_CODEC_AV1, swapped_stub, 3),
                   "/dev/video2", "av1-swapped-skip-stub");

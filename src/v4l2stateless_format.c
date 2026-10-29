@@ -1,9 +1,11 @@
 /*
  * Pixel-format helpers: V4L2 capture fourcc ↔ VA image fourcc, size, convert.
  *
- * rkvdec exposes NV12 / NV15 / NV16 / NV20. VA-API clients want NV12 / P010 /
- * YUY2. NV15 is packed 10-bit 4:2:0 (4 samples / 5 bytes, little-endian);
- * P010 stores 10 bits in the high end of a uint16 (sample << 6).
+ * Stateless decoders emit NV12 / NV15 / NV16 / NV20; VA-API clients want
+ * NV12 / P010 / YUY2. NV15 is packed 10-bit 4:2:0 (4 samples / 5 bytes,
+ * little-endian); P010 stores 10 bits in the high end of a uint16
+ * (sample << 6). MT8183 only produces NV12 and NV15 (plus tiled MM21); the
+ * 4:2:2 forms are shared-path code kept for the generic V4L2 case.
  */
 
 #include <stdint.h>

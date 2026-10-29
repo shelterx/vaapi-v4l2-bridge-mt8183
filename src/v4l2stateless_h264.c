@@ -328,7 +328,8 @@ void h264_fill_decode_params(struct v4l2_ctrl_h264_decode_params *dec,
 
     /*
      * Bit sizes the kernel needs to locate slice data inside the slice
-     * header (rkvdec HW starts parsing at a computed bit offset).
+     * header (the hardware parses the header itself and is told where the
+     * slice data starts).
      * dec_ref_pic_marking: IDR carries no_output_of_prior_pics_flag +
      * long_term_reference_flag (2 bits); a referenced non-IDR picture
      * carries adaptive_ref_pic_marking_mode_flag (1 bit, no entries in the
@@ -424,9 +425,9 @@ VAStatus v4l2sl_h264_translate(struct v4l2sl_context *ctx,
     struct v4l2_ctrl_h264_decode_params dec;
     struct v4l2_ctrl_h264_scaling_matrix sm;
     /*
-     * Note: VDPU381 (kernel 7.0+ refactored rkvdec) uses the frame-based
-     * UAPI — V4L2_CID_STATELESS_H264_SLICE_PARAMS is not registered and the
-     * kernel parses the slice header itself from the Annex B bitstream.
+     * Note: VDPU381 uses the frame-based UAPI —
+     * V4L2_CID_STATELESS_H264_SLICE_PARAMS is not registered and the kernel
+     * parses the slice header itself from the Annex B bitstream.
      */
 
     h264_fill_sps(&sps, pic_param, ctx->profile);
@@ -469,7 +470,7 @@ VAStatus v4l2sl_h264_translate(struct v4l2sl_context *ctx,
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
-    /* rkvdec only accepts NV15/NV16/NV20 after a matching SPS. HEVC
+    /* The driver only accepts NV15/NV16/NV20 after a matching SPS. HEVC
      * programs SPS as a global control before STREAMON; High10 must
      * do the same. Request-scoped SPS still goes on the picture. */
     {

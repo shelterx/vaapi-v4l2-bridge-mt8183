@@ -39,7 +39,14 @@ static int64_t g_prof_pending_frame_us;
 
 /* V4L2SL_DETILE=sw|hw|gpu. The single parse: everything that keys off the
  * de-tile choice (bo layout, MDP3 dispatch, pull dispatch) goes through this,
- * because a disagreement between them misplaces chroma in the exported bo. */
+ * because a disagreement between them misplaces chroma in the exported bo.
+ *
+ * hw is the MDP3 m2m block and serves exactly one 1080p60 stream: it has
+ * ~94 jobs/s of capacity at 1080p (10.6 ms/job, serialised across clients),
+ * so any further decode context in the process falls back to the software
+ * de-tiler. That fallback is expected behaviour, not a failure - see
+ * docs/mt8183-mdp3.md, "Job cost and capacity". Two 720p60 streams do fit on
+ * hw. gpu (Mali shader) and sw have no such process-wide limit. */
 enum v4l2sl_detile_mode v4l2sl_detile_mode(void)
 {
     const char *e = getenv("V4L2SL_DETILE");
@@ -168,7 +175,7 @@ int v4l2sl_setup_output_queue(int fd, uint32_t codec_format, int width, int heig
     /* hantro coded formats want sizeimage ~= luma size, not a 4MB guess.
      * GStreamer sizes H.264 OUTPUT as (width*height*pixel_bitdepth)/8;
      * 4:2:0 8-bit=12, 10-bit=15. A luma-sized buffer is too small for
-     * 10-bit High10 and rkvdec then writes an empty NV15 capture. */
+     * 10-bit High10 and the driver then writes an empty NV15 capture. */
     if (codec_format == V4L2_PIX_FMT_AV1_FRAME ||
         codec_format == V4L2_PIX_FMT_VP8_FRAME ||
         codec_format == V4L2_PIX_FMT_MPEG2_SLICE)
@@ -236,7 +243,7 @@ int v4l2sl_setup_capture_queue_count(int fd, int width, int height,
                                      uint32_t pixelformat, int count)
 {
     /* Set capture format (decoded output). Default NV12; 10-bit/422 use
-     * NV15/NV16/NV20 which rkvdec only accepts after a matching SPS. */
+     * NV15/NV16/NV20 which the driver only accepts after a matching SPS. */
     struct v4l2_format fmt = { 0 };
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     fmt.fmt.pix_mp.width = width;
@@ -474,9 +481,9 @@ void v4l2sl_decode_reset(struct v4l2sl_context *ctx)
         ctx->request_fd = -1;
     }
 
-    /* STREAMOFF hands every queued buffer back in ERROR state (rkvdec and
-     * hantro both do this in stop_streaming), so from this point every
-     * allocated index is userspace-owned again. */
+    /* STREAMOFF hands every queued buffer back in ERROR state (the hantro
+     * stop_streaming path does this), so from this point every allocated
+     * index is userspace-owned again. */
     rebuild_free_pools(ctx);
 }
 
@@ -1908,7 +1915,7 @@ int v4l2sl_set_request_controls(int request_fd, int v4l2_fd,
 
 /*
  * Set extended controls as plain (non-request) values. Some codecs bind
- * stream-level controls globally — e.g. the rkvdec HEVC SPS rejects the
+ * stream-level controls globally — e.g. the HEVC SPS control rejects the
  * request-scoped variant with EINVAL.
  */
 int v4l2sl_set_global_controls(int v4l2_fd, struct v4l2_ext_controls *ctrls)

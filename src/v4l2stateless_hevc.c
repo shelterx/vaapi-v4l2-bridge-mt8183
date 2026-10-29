@@ -258,7 +258,7 @@ VAStatus v4l2sl_hevc_translate(struct v4l2sl_context *ctx,
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
-    /* Set HEVC SPS — as a GLOBAL control: the rkvdec kernel rejects the
+    /* Set HEVC SPS — as a GLOBAL control: the kernel rejects the
      * request-scoped variant of this control with EINVAL. */
     struct v4l2_ext_control sps_ctrl = { 0 };
     sps_ctrl.id = V4L2_CID_STATELESS_HEVC_SPS;

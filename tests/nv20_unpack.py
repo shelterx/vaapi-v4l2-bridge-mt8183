@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unpack a raw NV16_10LE40 (V4L2 NV20) dump into planar yuv422p10le.
 
-The rkvdec capture buffer for 4:2:2 10-bit carries Y and full-height UV
+The 4:2:2 10-bit capture buffer carries Y and full-height UV
 planes of tight packed-10-bit rows (stride = width * 10 / 8) plus a
 colmv metadata tail appended by the kernel; this tool strips the tail.
 

@@ -312,7 +312,7 @@ struct v4l2sl_context {
         VASurfaceID buf_owner[V4L2SL_MAX_CAPTURE_BUFS];
     } av1;
 
-    /* Persistent M2M queues (stateful devices: RGA VPP / VEPU JPEG) */
+    /* Persistent M2M queues (stateful devices: VPP / JPEG encoder) */
     struct v4l2sl_m2m_state vpp_q;
     struct v4l2sl_m2m_state jpeg_q;
     /* MDP3 m2m HW de-tile (MM21 -> NV12); see v4l2sl_mdp3. */
@@ -441,7 +441,8 @@ int v4l2sl_decode_submit(struct v4l2sl_context *ctx, int out_buf_idx,
                          uint32_t bytesused, uint64_t timestamp);
 /* STREAMOFF both queues and rebuild the free pools from scratch. Used to
  * recover from decode timeouts so a wedged job is never left in the kernel
- * (rkvdec returns every queued buffer in ERROR state on STREAMOFF). */
+ * (the hantro stop_streaming path returns every queued buffer in ERROR state
+ * on STREAMOFF). */
 void v4l2sl_decode_reset(struct v4l2sl_context *ctx);
 int v4l2sl_surface_alloc_export_fd(struct v4l2sl_surface *s);
 int v4l2sl_surface_grow_memfd(struct v4l2sl_surface *s, uint32_t size);
@@ -657,7 +658,7 @@ VAStatus v4l2sl_mpeg2_translate(struct v4l2sl_context *ctx,
                                 struct v4l2sl_buffer **buffers,
                                 int num_buffers);
 
-/* JPEG encode / RGA VPP */
+/* JPEG encode / VPP */
 VAStatus v4l2sl_jpeg_encode(struct v4l2sl_context *ctx,
                             struct v4l2sl_buffer **buffers, int num_buffers);
 VAStatus v4l2sl_vpp_run(struct v4l2sl_context *ctx,

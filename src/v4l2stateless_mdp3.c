@@ -85,12 +85,30 @@ static void mdp3_stage_report(void)
 #define MDP3_DQ_TIMEOUT_MS 2000
 #define MDP3_FAIL_LIMIT    3   /* consecutive failures -> disable for session */
 
-/* Process-wide singleton: the m2m node is single-client. */
+/*
+ * Process-wide singleton, owned by one decode context at a time.
+ *
+ * Not because the kernel forbids more: mtk-mdp3 gives every open() its own
+ * m2m context (ida_alloc + per-fh ctrl handler in mdp_m2m_open), so two fds
+ * would work. It is a capacity decision. The node serves ~94 jobs/s at
+ * 1080p — one job is 10.6 ms (5.0 ms submission + 5.5 ms execution, 0.7 ms
+ * CPU), and jobs serialise completely: two clients on separate fds get
+ * 20.6 ms/job each, the same total throughput shared. That is exactly one
+ * 1080p60 stream, so a second context is better off on the software de-tiler
+ * (1.8 ms CPU/frame, holds 60 fps) than time-sharing the engine into ~48 fps.
+ * Two 720p60 streams do fit (measured 13.1 ms/job each), which is the case a
+ * per-context fd would be worth revisiting for. See docs/mt8183-mdp3.md,
+ * "Job cost and capacity".
+ *
+ * The per-job code also assumes sole ownership: it queues buffer index 0 on
+ * both queues, so a second owner would trample the queues rather than simply
+ * wait its turn.
+ */
 static struct v4l2sl_mdp3 g_mdp3 = { .fd = -1 };
 static struct v4l2sl_context *g_mdp3_owner;
 /* Two decode contexts can pull their first frame concurrently. Without this
- * lock both would open the single m2m device and reconfigure it under each
- * other, which corrupts the stream that initialised first. */
+ * lock both would open the m2m device and reconfigure it under each other,
+ * which corrupts the stream that initialised first. */
 static pthread_mutex_t g_mdp3_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int mdp3_reqbufs(int fd, uint32_t type, int count, uint32_t memory);
@@ -596,6 +614,17 @@ int v4l2sl_mdp3_init(struct v4l2sl_context *ctx, int width, int height)
     return ret;
 }
 
+/*
+ * One de-tile job on the calling thread, from a capture slot.
+ *
+ * This is the synchronous fallback, not the shipped configuration: a 1080p job
+ * is 10.6 ms, so running it inline puts pull at ~11.3 ms on top of the ~10 ms
+ * decode and misses the 16.7 ms frame budget (measured: 44.6 fps versus 60.4
+ * fps through the async worker). MDP3 has to stay pipelined - the opposite of
+ * the GPU path, where waiting for the write is what stops a non-syncing client
+ * from sampling a half-written bo. Applying that GPU conclusion here costs a
+ * quarter of the frame rate.
+ */
 int v4l2sl_mdp3_detile(struct v4l2sl_context *ctx, int buf_index,
                        struct v4l2sl_surface *surf)
 {
