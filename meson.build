@@ -103,6 +103,21 @@ test_format = executable('test_format',
 
 test('format', test_format)
 
+# Lifecycle test: no decoder, no video. It loads the built driver shared
+# object the same way libva does (LIBVA_DRIVERS_PATH makes libva open that
+# file, TEST_DRIVER_SO is what the test dlopens), so vaTerminate reaches the
+# very GL thread the test started. Skips when there is no render node.
+test_gpu_teardown = executable('test_gpu_teardown',
+  files('tests/test_gpu_teardown.c'),
+  include_directories: inc,
+  c_args: '-DTEST_DRIVER_SO="' + meson.current_build_dir() / 'v4l2stateless_drv_video.so' + '"',
+  dependencies: [libva_dep, libva_drm_dep, libdrm_dep, gbm_dep, egl_dep],
+)
+
+test('gpu_teardown', test_gpu_teardown,
+  env: ['LIBVA_DRIVER_NAME=v4l2stateless',
+        'LIBVA_DRIVERS_PATH=' + meson.current_build_dir()])
+
 va_export_client = executable('va_export_client',
   files('tests/va_export_client.c'),
   dependencies: [libva_dep, libva_drm_dep, libdrm_dep,
