@@ -137,11 +137,30 @@ static const char *cached_device(struct v4l2sl_driver_data *dd, enum v4l2sl_code
  * VA-API driver VTable implementations
  */
 
-/* Per-dimension limit advertised to clients in the config and surface
- * attributes; both must agree. MT8183 clamps MM21 capture to 2048x1088, so
- * this 4096 is a leftover from the driver's rkvdec origins — see the open
- * question in docs/AGENTS.md before tightening it. */
-#define V4L2SL_MAX_PICTURE_DIM 4096
+/*
+ * Per-dimension limit advertised to clients in the config and surface
+ * attributes; every site must agree, because a client that passes one check
+ * and fails the other ends up in a half-configured context.
+ *
+ * These are the driver's own numbers, not a policy of ours:
+ * mtk_vcodec_dec.h declares MTK_VDEC_MAX_W 2048 / MTK_VDEC_MAX_H 1088, and
+ * every stateless format carries stepwise_fhd (max_width/height taken from
+ * those, step 16). mtk_vcodec_dec.c clamps S_FMT against them, which is why
+ * 2049x1088 and 3840x2160 both come back as 2048x1088. The 4K path in that
+ * driver (VCODEC_DEC_4K_CODED_WIDTH/HEIGHT, guarded by
+ * VCODEC_CAPABILITY_4K_DISABLED) is not enabled for MT8183, so 2048x1088 is
+ * also the whole story for capture, and MM21 is the only capture format the
+ * SoC advertises - there is no linear format to fall back on at 4K.
+ *
+ * Advertising more than this does not buy a 4K path: capture is clamped while
+ * the stream is not, so the bridge renegotiates the queue every frame
+ * (measured: 100 renegotiations and 90 frames in 12 s of a 3840x2160 clip,
+ * 124-495 ms frame intervals). Advertising the truth makes the client fall
+ * back to software decode instead. Keep these in step with the kernel if a
+ * 4K-capable MT8183 path ever appears.
+ */
+#define V4L2SL_MAX_PICTURE_W 2048
+#define V4L2SL_MAX_PICTURE_H 1088
 
 
 static void destroy_surface_locked(struct v4l2sl_driver_data *dd,
@@ -325,10 +344,10 @@ v4l2sl_get_config_attributes(VADriverContextP ctx,
             attrib_list[i].value = 100;
             break;
         case VAConfigAttribMaxPictureWidth:
-            attrib_list[i].value = V4L2SL_MAX_PICTURE_DIM;
+            attrib_list[i].value = V4L2SL_MAX_PICTURE_W;
             break;
         case VAConfigAttribMaxPictureHeight:
-            attrib_list[i].value = V4L2SL_MAX_PICTURE_DIM;
+            attrib_list[i].value = V4L2SL_MAX_PICTURE_H;
             break;
         default:
             attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
@@ -481,10 +500,10 @@ v4l2sl_query_config_attributes(VADriverContextP ctx,
     attribs[count].value = VA_DEC_SLICE_MODE_NORMAL;
     count++;
     attribs[count].type = VAConfigAttribMaxPictureWidth;
-    attribs[count].value = V4L2SL_MAX_PICTURE_DIM;
+    attribs[count].value = V4L2SL_MAX_PICTURE_W;
     count++;
     attribs[count].type = VAConfigAttribMaxPictureHeight;
-    attribs[count].value = V4L2SL_MAX_PICTURE_DIM;
+    attribs[count].value = V4L2SL_MAX_PICTURE_H;
     count++;
     attribs[count].type = VAConfigAttribEncPackedHeaders;
     attribs[count].value = 0;
@@ -561,13 +580,13 @@ v4l2sl_query_surface_attributes(VADriverContextP ctx,
     attribs[count].type          = VASurfaceAttribMaxWidth;
     attribs[count].flags         = VA_SURFACE_ATTRIB_GETTABLE;
     attribs[count].value.type    = VAGenericValueTypeInteger;
-    attribs[count].value.value.i = V4L2SL_MAX_PICTURE_DIM;
+    attribs[count].value.value.i = V4L2SL_MAX_PICTURE_W;
     count++;
 
     attribs[count].type          = VASurfaceAttribMaxHeight;
     attribs[count].flags         = VA_SURFACE_ATTRIB_GETTABLE;
     attribs[count].value.type    = VAGenericValueTypeInteger;
-    attribs[count].value.value.i = V4L2SL_MAX_PICTURE_DIM;
+    attribs[count].value.value.i = V4L2SL_MAX_PICTURE_H;
     count++;
 
     attribs[count].type          = VASurfaceAttribMemoryType;
