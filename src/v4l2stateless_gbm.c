@@ -254,42 +254,37 @@ int v4l2sl_gbm_surface_sync(struct v4l2sl_surface *s)
  * (visible h rows, UV at stride*h), while the capture is tiled on the
  * aligned geometry, so Y and UV need independent pointers/strides and the
  * padding rows past h must not be written. */
+/*
+ * MM21 tiles are 16x32 bytes (luma) and 16x16 (chroma, 8x16 samples), laid out
+ * row-major inside the tile, so every row of every tile block is a straight
+ * 16-byte copy. Walk the destination row-major and let the 16-byte copy be a
+ * single NEON load/store: the previous tile-major order wrote 16 bytes at a
+ * time 1920 bytes apart, dirtying each 64-byte line three times.
+ */
 static void detile_planes_to(const uint8_t *ysrc, const uint8_t *usrc,
                              uint8_t *ydst, uint32_t ystride,
                              uint8_t *udst, uint32_t ustride,
                              uint32_t aw, uint32_t ah, uint32_t vis_h)
 {
-    uint32_t y_tc = aw / 16, y_tr = ah / 32;
+    uint32_t y_tc = aw / 16;
     uint32_t uvis = (vis_h + 1) / 2;
 
-    for (uint32_t tr = 0; tr < y_tr; tr++)
-        for (uint32_t tc = 0; tc < y_tc; tc++) {
-            const uint8_t *ts = ysrc + (size_t)(tr * y_tc + tc) * 512;
+    for (uint32_t y = 0; y < vis_h; y++) {
+        const uint8_t *ts = ysrc + (size_t)(y / 32) * y_tc * 512 +
+                            (size_t)(y % 32) * 16;
+        uint8_t *d = ydst + (size_t)y * ystride;
 
-            for (uint32_t r = 0; r < 32; r++) {
-                uint32_t y = tr * 32 + r;
+        for (uint32_t tc = 0; tc < y_tc; tc++)
+            memcpy(d + (size_t)tc * 16, ts + (size_t)tc * 512, 16);
+    }
+    for (uint32_t y = 0; y < uvis; y++) {
+        const uint8_t *ts = usrc + (size_t)(y / 16) * y_tc * 256 +
+                            (size_t)(y % 16) * 16;
+        uint8_t *d = udst + (size_t)y * ustride;
 
-                if (y >= vis_h)
-                    break;
-                for (uint32_t c = 0; c < 16; c++)
-                    ydst[(size_t)y * ystride + (size_t)tc * 16 + c] =
-                        ts[r * 16 + c];
-            }
-        }
-    for (uint32_t tr = 0; tr < y_tr; tr++)
-        for (uint32_t tc = 0; tc < y_tc; tc++) {
-            const uint8_t *ts = usrc + (size_t)(tr * y_tc + tc) * 256;
-
-            for (uint32_t r = 0; r < 16; r++) {
-                uint32_t y = tr * 16 + r;
-
-                if (y >= uvis)
-                    break;
-                for (uint32_t c = 0; c < 16; c++)
-                    udst[(size_t)y * ustride + (size_t)tc * 16 + c] =
-                        ts[r * 16 + c];
-            }
-        }
+        for (uint32_t tc = 0; tc < y_tc; tc++)
+            memcpy(d + (size_t)tc * 16, ts + (size_t)tc * 256, 16);
+    }
 }
 
 /*
