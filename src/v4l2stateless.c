@@ -171,6 +171,8 @@ static struct v4l2sl_context *context_for_surface(struct v4l2sl_driver_data *dd,
                                                   VASurfaceID surface);
 static int v4l2sl_context_is_alive(struct v4l2sl_driver_data *dd,
                                    struct v4l2sl_context *c);
+static void null_capture_owner(struct v4l2sl_driver_data *dd,
+                               struct v4l2sl_context *context);
 
 static VAStatus
 v4l2sl_terminate(VADriverContextP ctx)
@@ -198,6 +200,7 @@ v4l2sl_terminate(VADriverContextP ctx)
             buf = next;
         }
         v4l2sl_release_context_device(context);
+        null_capture_owner(driver_data, context);
         free(context->device_path);
         free(context->render_targets);
         free(context);
@@ -952,6 +955,23 @@ v4l2sl_context_is_alive(struct v4l2sl_driver_data *dd, struct v4l2sl_context *c)
     return 0;
 }
 
+/* Surfaces may outlive their context (the client can destroy the context
+ * before its surface pool, and terminate frees contexts before surfaces):
+ * null the back-pointer of every surface that claims a slot on it, so no
+ * path (fence table, cap_height, source cache) dereferences the freed
+ * struct. The fence table was already emptied by wait_pending() inside
+ * release_context_device. Caller holds g_v4l2sl_lock. */
+static void null_capture_owner(struct v4l2sl_driver_data *dd,
+                               struct v4l2sl_context *context)
+{
+    for (int i = 0; i < V4L2SL_MAX_SURFACES; i++) {
+        struct v4l2sl_surface *s = dd->surfaces[i];
+
+        if (s && s->capture_owner == context)
+            s->capture_owner = NULL;
+    }
+}
+
 static VAStatus
 v4l2sl_destroy_surfaces(VADriverContextP ctx,
                         VASurfaceID *surfaces,
@@ -1264,6 +1284,7 @@ v4l2sl_destroy_context(VADriverContextP ctx, VAContextID context_id)
             *pp = context->next;
 
             v4l2sl_release_context_device(context);
+            null_capture_owner(driver_data, context);
             free(context->device_path);
             free(context->render_targets);
             free(context);
