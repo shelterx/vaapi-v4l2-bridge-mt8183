@@ -556,18 +556,27 @@ static GLuint gpu_src_texture(struct v4l2sl_context *ctx, int buf_index,
 /*
  * Publish the fence instead of waiting for it.
  *
- * The de-tile job and every GPU consumer of the bo are serialised by the GPU
- * itself: we submit first, so a compositor sampling the bo afterwards runs
- * after us and reads complete pixels. Waiting here only stalls the worker.
+ * Nothing orders a consumer after this job: the de-tile runs on a private
+ * EGL display (its own DRM fd), so panfrost does not serialise the client's
+ * draws behind it, and panfrost's sampler ignores the reservation fence. A
+ * client sampling the bo at this instant can see half-written rows; in
+ * practice the exposure is covered by display latency - Chromium exports the
+ * bo once and composites it at the earliest a vsync later (measured: 22
+ * vaSyncSurface calls per session, none per frame), far longer than the
+ * 0.5-1 ms the shader needs.
+ *
+ * Waiting here instead serialises the decode thread on the GPU. That costs a
+ * little with one stream and a lot with several, because the GL thread is
+ * shared: two 1080p60 windows advance 8.3-9.0 s of media per 10 s with the
+ * async handoff, 7.5 s when the job runs inline (V4L2SL_DETILE_ASYNC=0), and
+ * 5.1-6.5 s when the fence is waited for as well (frame drops 2.6/15 % ->
+ * 6.1/25 %). Both knobs exist to measure that trade-off; the default is
+ * asynchronous on purpose.
  *
  * The fence is still exported and attached to the bo's reservation object so
  * kernel-mediated users (CPU readback via dma_buf_begin_cpu_access, KMS) wait
- * properly, and a copy of it is kept on the surface for the CPU paths that
- * panfrost does not order for us (gbm_bo_map does not wait).
- *
- * Measured on the cross-screen probe: panfrost's *sampler* ignores this
- * fence, so it must never be the only thing between a half-written bo and a
- * consumer. GPU queue order is what makes this safe.
+ * properly, and a copy is kept on the surface for the CPU paths panfrost does
+ * not order for us (gbm_bo_map does not wait).
  */
 static int gpu_publish_write_fence(struct v4l2sl_surface *s, int bo_fd,
                                    double *wait_ms)
