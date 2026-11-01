@@ -274,6 +274,8 @@ struct v4l2sl_context {
     uint32_t cap_stride;       /* bytes per row, may exceed width */
     uint32_t cap_sizeimage;    /* per-buffer plane size */
     uint32_t cap_pixelformat;  /* V4L2 capture fourcc (NV12/NV15/NV16/NV20) */
+    uint32_t cap_num_planes;   /* capture plane count (2 for MM21), learned at
+                                * setup so QBUF does not need a QUERYBUF */
 
     /* Frame counter for V4L2 timestamps (DPB reference matching) */
     uint64_t frame_count;
@@ -416,6 +418,7 @@ int v4l2sl_streamon(int fd, enum v4l2_buf_type type);
 int v4l2sl_streamoff(int fd, enum v4l2_buf_type type);
 void v4l2sl_release_context_device(struct v4l2sl_context *ctx);
 int v4l2sl_get_capture_geometry(int fd, uint32_t *w, uint32_t *h,
+                                uint32_t *planes,
                                 uint32_t *stride, uint32_t *sizeimage);
 int v4l2sl_ensure_capture(struct v4l2sl_context *ctx, int width, int height,
                           uint32_t pixelformat);

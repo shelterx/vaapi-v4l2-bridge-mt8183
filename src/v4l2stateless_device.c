@@ -1025,6 +1025,7 @@ int v4l2sl_ensure_capture(struct v4l2sl_context *ctx, int width, int height,
     ctx->cap_pixelformat = fourcc;
 
     if (v4l2sl_get_capture_geometry(ctx->v4l2_fd, &ctx->cap_width, &ctx->cap_height,
+                                    &ctx->cap_num_planes,
                                     &ctx->cap_stride, &ctx->cap_sizeimage) == 0) {
         fprintf(stderr, "v4l2stateless: capture geometry %ux%u stride=%u size=%u fourcc=%.4s\n",
                 ctx->cap_width, ctx->cap_height, ctx->cap_stride, ctx->cap_sizeimage,
@@ -1042,6 +1043,7 @@ int v4l2sl_ensure_capture(struct v4l2sl_context *ctx, int width, int height,
  * use these values, not the display dimensions.
  */
 int v4l2sl_get_capture_geometry(int fd, uint32_t *w, uint32_t *h,
+                                uint32_t *planes,
                                 uint32_t *stride, uint32_t *sizeimage)
 {
     struct v4l2_format fmt = { 0 };
@@ -1054,6 +1056,8 @@ int v4l2sl_get_capture_geometry(int fd, uint32_t *w, uint32_t *h,
 
     *w = fmt.fmt.pix_mp.width;
     *h = fmt.fmt.pix_mp.height;
+    if (planes)
+        *planes = fmt.fmt.pix_mp.num_planes;
     *stride = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
     *sizeimage = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
     return 0;
@@ -1269,12 +1273,15 @@ int v4l2sl_queue_capture(struct v4l2sl_context *ctx, int buf_index,
     buf.memory = V4L2_MEMORY_MMAP;
     buf.index = buf_index;
 
-    /* Multiplanar QBUF requires buf.length == the plane count. MM21 is 2
-     * planes (Y + UV); a bare 1 makes vb2 reject the QBUF with EINVAL. Query
-     * the buffer to learn the count (works for NV12's 1 plane too). */
-    {
+    /* Multiplanar QBUF requires buf.length == the plane count. The count is a
+     * property of the queue (2 for MM21, 1 for NV12), learned once at capture
+     * setup; querying it per frame was one ioctl on every QBUF. */
+    if (ctx->cap_num_planes > 0) {
+        buf.length = ctx->cap_num_planes;
+    } else {
         struct v4l2_buffer q = { 0 };
         struct v4l2_plane qp[VIDEO_MAX_PLANES] = { 0 };
+
         q.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         q.memory = V4L2_MEMORY_MMAP;
         q.index = buf_index;
