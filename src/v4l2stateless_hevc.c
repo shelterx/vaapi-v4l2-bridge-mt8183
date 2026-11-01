@@ -220,7 +220,6 @@ VAStatus v4l2sl_hevc_translate(struct v4l2sl_context *ctx,
                                int num_buffers)
 {
     VAPictureParameterBufferHEVC *pic_param = NULL;
-    VASliceParameterBufferHEVC *slice_param = NULL;
     VAQMatrixBufferHEVC *qm = NULL;
 
     struct v4l2sl_collected cb;
@@ -229,7 +228,6 @@ VAStatus v4l2sl_hevc_translate(struct v4l2sl_context *ctx,
     v4l2sl_collect_decode_buffers(buffers, num_buffers, &cb);
     pic_param = cb.pic;
     qm = cb.iq;
-    slice_param = cb.n_slice_params ? cb.slice_params[0] : NULL;
     n_slice_data = cb.n_slice_datas;
 
     if (!pic_param) {

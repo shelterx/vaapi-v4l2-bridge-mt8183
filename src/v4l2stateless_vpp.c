@@ -178,14 +178,14 @@ VAStatus v4l2sl_vpp_run(struct v4l2sl_context *ctx,
     }
     /* Client-controlled regions are clamped to the surfaces — an oversized
      * region must never write past the destination backing. */
-    if (dw > dst->width)
-        dw = dst->width;
-    if (dh > dst->height)
-        dh = dst->height;
-    if (sw > src->width)
-        sw = src->width;
-    if (sh > src->height)
-        sh = src->height;
+    if (dw > (int)dst->width)
+        dw = (int)dst->width;
+    if (dh > (int)dst->height)
+        dh = (int)dst->height;
+    if (sw > (int)src->width)
+        sw = (int)src->width;
+    if (sh > (int)src->height)
+        sh = (int)src->height;
     if (pipe->rotation_state == VA_ROTATION_90 ||
         pipe->rotation_state == VA_ROTATION_270)
         rotate = (pipe->rotation_state == VA_ROTATION_90) ? 90 : 270;

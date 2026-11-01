@@ -47,7 +47,7 @@ static int gpu_threads(void)
     if (!d)
         return -1;
     while ((e = readdir(d))) {
-        char path[64], comm[32] = "";
+        char path[320], comm[32] = "";
         FILE *f;
 
         if (e->d_name[0] == '.')

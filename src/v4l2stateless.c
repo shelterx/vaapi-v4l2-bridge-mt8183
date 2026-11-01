@@ -423,6 +423,9 @@ v4l2sl_get_config_attributes(VADriverContextP ctx,
                              VAConfigAttrib *attrib_list,
                              int num_attribs)
 {
+    (void)ctx;
+    (void)entrypoint;
+
     for (int i = 0; i < num_attribs; i++) {
         switch (attrib_list[i].type) {
         case VAConfigAttribRTFormat:
@@ -1093,6 +1096,7 @@ v4l2sl_create_context(VADriverContextP ctx,
                       int num_render_targets,
                       VAContextID *context_id)
 {
+    (void)flag;
     struct v4l2sl_driver_data *driver_data = ctx->pDriverData;
 
     if (v4l2sl_debug)
@@ -1456,6 +1460,8 @@ static VAStatus
 v4l2sl_unmap_buffer(VADriverContextP ctx, VABufferID buf_id)
 {
     /* No-op — we use malloc'd memory */
+    (void)ctx;
+    (void)buf_id;
     return VA_STATUS_SUCCESS;
 }
 
@@ -1820,6 +1826,9 @@ v4l2sl_query_surface_error(VADriverContextP ctx,
                            VAStatus error_status,
                            void **error_info)
 {
+    (void)ctx;
+    (void)render_target;
+    (void)error_status;
     if (error_info)
         *error_info = NULL;
     return VA_STATUS_SUCCESS;
@@ -1838,6 +1847,7 @@ v4l2sl_query_image_formats(VADriverContextP ctx,
                            VAImageFormat *format_list,
                            int *num_formats)
 {
+    (void)ctx;
     static const struct {
         uint32_t fourcc;
         int depth;
@@ -2161,8 +2171,8 @@ v4l2sl_get_image(VADriverContextP ctx, VASurfaceID surface,
     const uint8_t *src;
     void *mapped = NULL;
     size_t map_size = 0;
-    int copy_w = (int)width < surf->width ? (int)width : surf->width;
-    int copy_h = (int)height < surf->height ? (int)height : surf->height;
+    int copy_w = (int)width < (int)surf->width ? (int)width : (int)surf->width;
+    int copy_h = (int)height < (int)surf->height ? (int)height : (int)surf->height;
     uint32_t dst_fourcc = ib->fourcc;
     uint32_t dst_stride;
 
@@ -2294,8 +2304,9 @@ v4l2sl_put_image(VADriverContextP ctx,
         pthread_mutex_unlock(&g_v4l2sl_lock);
         return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
     }
-    copy_w = (int)src_width < surf->width ? (int)src_width : surf->width;
-    copy_h = (int)src_height < surf->height ? (int)src_height : surf->height;
+    copy_w = (int)src_width < (int)surf->width ? (int)src_width : (int)surf->width;
+    copy_h = (int)src_height < (int)surf->height ? (int)src_height
+                                                 : (int)surf->height;
     v4l2sl_copy_nv12(surf->cpu_ptr, surf->cpu_stride, src,
                      ib->pitch ? ib->pitch : (uint32_t)copy_w,
                      copy_h, copy_w, copy_h);
@@ -2472,6 +2483,20 @@ v4l2sl_put_surface(VADriverContextP ctx,
                    unsigned int flags)
 {
     /* Not needed for decode-only driver */
+    (void)ctx;
+    (void)surface;
+    (void)draw;
+    (void)src_x;
+    (void)src_y;
+    (void)src_w;
+    (void)src_h;
+    (void)dest_x;
+    (void)dest_y;
+    (void)dest_w;
+    (void)dest_h;
+    (void)cliprects;
+    (void)number_cliprects;
+    (void)flags;
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
@@ -2481,6 +2506,7 @@ v4l2sl_put_surface(VADriverContextP ctx,
 static VAStatus
 v4l2sl_stub_unimplemented(VADriverContextP ctx)
 {
+    (void)ctx;
     return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
