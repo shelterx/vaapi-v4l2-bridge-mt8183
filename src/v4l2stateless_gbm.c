@@ -502,12 +502,17 @@ int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
     /* A failed GPU job may still be writing this bo; the software fallback
      * rewrites it, so the two must not overlap. */
     v4l2sl_gpu_wait_surface(s);
-    (void)ah;   /* tiling is derived from the destination rows */
     uint32_t w = s->width, h = s->height;
     void *map_data = NULL;
     uint32_t mstride = 0;
     uint8_t *dst;
 
+    /* The capture plane is only ah rows tall. A surface taller than the
+     * clamped capture (a client that ignored the advertised 2048x1088 limit,
+     * which is never enforced at vaCreateSurfaces) must not read past it:
+     * de-tile min(h,ah) rows and edge-fill the rest so the source read stays
+     * in bounds and the bo has no unwritten band. */
+    uint32_t vis_h = h < ah ? h : ah;
     uint32_t uv = s ? (s->bo_uv_rows ? s->bo_uv_rows : h) : h;
 
     if (!s || !s->gbm_bo || !ysrc || !usrc)
@@ -521,7 +526,17 @@ int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
         return -1;
     }
     detile_planes_to(ysrc, usrc, dst, mstride,
-                     dst + (size_t)mstride * uv, mstride, aw, h);
+                     dst + (size_t)mstride * uv, mstride, aw, vis_h);
+    if (vis_h > 0 && vis_h < h) {
+        /* Surface taller than the capture: repeat the last valid row into
+         * the extra luma/chroma rows (edge clamp) so nothing is left unwritten. */
+        uint8_t *ylast = dst + (size_t)mstride * (vis_h - 1);
+        for (uint32_t y = vis_h; y < h; y++)
+            memcpy(dst + (size_t)mstride * y, ylast, w);
+        uint8_t *ulast = dst + (size_t)mstride * (uv + (vis_h + 1) / 2 - 1);
+        for (uint32_t y = (vis_h + 1) / 2; y < (h + 1) / 2; y++)
+            memcpy(dst + (size_t)mstride * (uv + y), ulast, w);
+    }
     gbm_bo_unmap(s->gbm_bo, map_data);
     return 0;
 }
