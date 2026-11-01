@@ -899,7 +899,7 @@ static int gpu_job(struct v4l2sl_surface *s, int y_fd, int uv_fd)
 
     uint32_t cap_stride, ah, tiles, aw;
     GLuint ty = 0, tu = 0, fbo;
-    int bo_fd = -1, rc = -1, attempted = 0;
+    int bo_fd = -1, rc = -1, attempted = 0, transient = 0;
     double wait_ms = 0.0;
     double t0, t_makecur = 0.0, t_import = 0.0, t_draw = 0.0;
 
@@ -942,6 +942,12 @@ static int gpu_job(struct v4l2sl_surface *s, int y_fd, int uv_fd)
     tu = gpu_src_texture(s->capture_owner, s->buf_index, 1, uv_fd, 256, tiles);
     t_import = gpu_now_ms() - t0;
     if (!ty || !tu) {
+        /* Transient only if every failing plane is a no-fd cache miss (its
+         * entry was evicted between the sources_ready check and this job --
+         * multi-stream ring pressure); a failing plane that did carry an fd
+         * is a genuine import fault. The next frame re-exports and recovers,
+         * so a transient miss must not trip the one-strike HW->SW fallback. */
+        transient = (!ty ? y_fd < 0 : 1) && (!tu ? uv_fd < 0 : 1);
         fprintf(stderr, "v4l2stateless: gpu: plane import failed (y=%d "
                         "u=%d err=0x%x tid=%lu)\n",
                 y_fd, uv_fd, eglGetError(),
@@ -986,12 +992,21 @@ release:
 unlock:
     pthread_mutex_unlock(&g_gpu_lock);
     if (rc < 0 && attempted && !g_gpu_failed) {
-        /* One strike: the session drops to the software de-tile, and the
-         * caller rewrites this same bo synchronously. */
-        g_gpu_failed = 1;
-        if (g_gpu.state > 0)
-            fprintf(stderr, "v4l2stateless: de-tile HW->SW (gpu job failed; "
-                            "software de-tile from now on)\n");
+        if (transient) {
+            /* Cache miss with no fd: the entry was evicted between the
+             * sources_ready check and this job. Keep the GPU path enabled --
+             * the next frame re-exports and recovers. This frame is lost. */
+            fprintf(stderr,
+                    "v4l2stateless: gpu: transient source miss (y=%d u=%d); "
+                    "frame lost, GPU path kept\n", y_fd, uv_fd);
+        } else {
+            /* One strike: the session drops to the software de-tile, and the
+             * caller rewrites this same bo synchronously. */
+            g_gpu_failed = 1;
+            if (g_gpu.state > 0)
+                fprintf(stderr, "v4l2stateless: de-tile HW->SW (gpu job failed; "
+                                "software de-tile from now on)\n");
+        }
     }
 out:
     /* The fds belong to the caller: it keeps them open until the job has
