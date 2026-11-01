@@ -264,7 +264,7 @@ int v4l2sl_gbm_surface_sync(struct v4l2sl_surface *s)
 static void detile_planes_to(const uint8_t *ysrc, const uint8_t *usrc,
                              uint8_t *ydst, uint32_t ystride,
                              uint8_t *udst, uint32_t ustride,
-                             uint32_t aw, uint32_t ah, uint32_t vis_h)
+                             uint32_t aw, uint32_t vis_h)
 {
     uint32_t y_tc = aw / 16;
     uint32_t uvis = (vis_h + 1) / 2;
@@ -502,6 +502,7 @@ int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
     /* A failed GPU job may still be writing this bo; the software fallback
      * rewrites it, so the two must not overlap. */
     v4l2sl_gpu_wait_surface(s);
+    (void)ah;   /* tiling is derived from the destination rows */
     uint32_t w = s->width, h = s->height;
     void *map_data = NULL;
     uint32_t mstride = 0;
@@ -520,7 +521,7 @@ int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
         return -1;
     }
     detile_planes_to(ysrc, usrc, dst, mstride,
-                     dst + (size_t)mstride * uv, mstride, aw, ah, h);
+                     dst + (size_t)mstride * uv, mstride, aw, h);
     gbm_bo_unmap(s->gbm_bo, map_data);
     return 0;
 }
