@@ -899,7 +899,7 @@ static int gpu_job(struct v4l2sl_surface *s, int y_fd, int uv_fd)
 
     uint32_t cap_stride, ah, tiles, aw;
     GLuint ty = 0, tu = 0, fbo;
-    int bo_fd = -1, rc = -1, attempted = 0, transient = 0;
+    int bo_fd = -1, rc = -1, attempted = 0, transient = 0, geom = 0;
     double wait_ms = 0.0;
     double t0, t_makecur = 0.0, t_import = 0.0, t_draw = 0.0;
 
@@ -911,6 +911,11 @@ static int gpu_job(struct v4l2sl_surface *s, int y_fd, int uv_fd)
     /* The shader indexes tiles by (stride/16, aligned_h/32); a plane that is
      * not a whole number of tiles cannot be de-tiled this way. */
     if (!cap_stride || !ah || cap_stride % 16 || ah % 32 || s->gbm_stride < 16)
+        goto out;
+    /* The de-tile reads ah luma rows from the capture plane (s->aligned_h
+     * rows). A bo taller than the capture -- a surface created past the
+     * clamped geometry -- would read past it, so refuse the job. */
+    if (ah > s->aligned_h)
         goto out;
     tiles = (cap_stride / 16) * (ah / 32);
     /* Never write past the bo's row stride, and never read past the source
@@ -930,6 +935,19 @@ static int gpu_job(struct v4l2sl_surface *s, int y_fd, int uv_fd)
         !eglMakeCurrent(g_gpu.dpy, g_gpu.surf, g_gpu.surf, g_gpu.ctx))
         goto unlock;
     t_makecur = gpu_now_ms() - t0;
+
+    /* The source image is `tiles` rows tall (512/256 wide). A capture whose
+     * tile count exceeds the GL texture limit can't be imported; refuse the
+     * job rather than fail the draw. Not a GPU fault, so it must not take the
+     * one-strike HW->SW fallback. */
+    {
+        GLint max_tex = 0;
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
+        if (max_tex > 0 && tiles > (uint32_t)max_tex) {
+            geom = 1;
+            goto unlock;
+        }
+    }
 
     /* Delete the objects of surfaces destroyed since the last job; this is the
      * only thread where the context is current. */
@@ -992,7 +1010,18 @@ release:
 unlock:
     pthread_mutex_unlock(&g_gpu_lock);
     if (rc < 0 && attempted && !g_gpu_failed) {
-        if (transient) {
+        if (geom) {
+            /* Bad geometry (bo taller than the capture, or the source image
+             * over the texture limit): not a GPU fault. This frame is lost
+             * and the caller rewrites it in software; the GPU path stays
+             * enabled for valid surfaces. */
+            static int geom_warned;
+            if (!geom_warned++)
+                fprintf(stderr,
+                        "v4l2stateless: gpu: geometry refused (bo taller than "
+                        "capture, or image over the texture limit); software "
+                        "de-tile for this surface\n");
+        } else if (transient) {
             /* Cache miss with no fd: the entry was evicted between the
              * sources_ready check and this job. Keep the GPU path enabled --
              * the next frame re-exports and recovers. This frame is lost. */
