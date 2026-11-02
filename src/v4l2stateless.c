@@ -27,6 +27,7 @@
 
 #include "v4l2stateless.h"
 #include "v4l2stateless_probe.h"
+#include "v4l2sl_logsite.h"
 
 /* Global driver-wide lock — statically initialized, immune to struct-layout
  * or init-order issues. libva dispatches to the backend without serializing
@@ -39,6 +40,29 @@ static pthread_mutex_t g_v4l2sl_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Read once at init: every hot-path debug gate tests this flag instead of
  * rescanning environ per frame. */
 int v4l2sl_debug;
+
+/* Failure-log registry (see v4l2sl_logsite.h). Sites in every translation
+ * unit register themselves at load time; the exit summary loops over this. */
+struct v4l2sl_logsite *g_v4l2sl_logsites[V4L2SL_MAX_LOGSITES];
+int g_v4l2sl_nlogsites;
+
+void v4l2sl_logsite_summary(void)
+{
+    int i, any = 0;
+
+    for (i = 0; i < g_v4l2sl_nlogsites; i++)
+        if (atomic_load(&g_v4l2sl_logsites[i]->total))
+            any = 1;
+    if (!any)
+        return;
+    fprintf(stderr, "v4l2stateless: failures:");
+    for (i = 0; i < g_v4l2sl_nlogsites; i++) {
+        unsigned long t = atomic_load(&g_v4l2sl_logsites[i]->total);
+        if (t)
+            fprintf(stderr, " %s=%lu", g_v4l2sl_logsites[i]->name, t);
+    }
+    fprintf(stderr, "\n");
+}
 
 /* Supported profiles */
 static const VAProfile v4l2sl_profiles[] = {
@@ -240,6 +264,9 @@ v4l2sl_terminate(VADriverContextP ctx)
      * outlive vaTerminate (they were only reclaimed at process exit). */
     v4l2sl_gbm_detile_wait();
     v4l2sl_gpu_fini();
+
+    /* One line with every non-zero failure counter; a clean run prints nothing. */
+    v4l2sl_logsite_summary();
 
     free(driver_data);
     ctx->pDriverData = NULL;

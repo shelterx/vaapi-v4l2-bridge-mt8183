@@ -56,6 +56,15 @@
 #include <drm_fourcc.h>
 #include <linux/dma-buf.h>
 #include "v4l2stateless.h"
+#include "v4l2sl_logsite.h"
+
+/* Failure-log sites for this translation unit (see v4l2sl_logsite.h). */
+V4L2SL_LOGSITE(site_gpu_job_failed, "gpu-job-failed");
+V4L2SL_LOGSITE_REG(site_gpu_job_failed);
+V4L2SL_LOGSITE(site_gpu_src_miss, "gpu-src-miss");
+V4L2SL_LOGSITE_REG(site_gpu_src_miss);
+V4L2SL_LOGSITE(site_detile_fallback, "detile-fallback");
+V4L2SL_LOGSITE_REG(site_detile_fallback);
 
 /* Entry points not necessarily linkable as plain symbols. */
 static PFNEGLCREATEIMAGEKHRPROC g_create_image;
@@ -518,8 +527,12 @@ static GLuint gpu_src_texture(struct v4l2sl_context *ctx, int buf_index,
     if (!e) {
         /* A miss needs the plane's dma-buf; the caller only exports it then
          * (otherwise this is 2 EXPBUF ioctls per frame for images it has). */
-        if (fd < 0)
+        if (fd < 0) {
+            V4L2SL_LOG_LIMITED(&site_gpu_src_miss,
+                               "source miss plane=%d buf=%d (no fd)\n",
+                               plane, buf_index);
             return 0;
+        }
         /* Reuse the next slot; we are on the GL thread with the context
          * current, so its old objects can be deleted immediately. */
         e = &g_gpu.src[g_gpu.src_next];
@@ -1010,31 +1023,30 @@ release:
 unlock:
     pthread_mutex_unlock(&g_gpu_lock);
     if (rc < 0 && attempted && !g_gpu_failed) {
+        V4L2SL_LOG_LIMITED(&site_gpu_job_failed, "gpu job failed (rc=%d)\n", rc);
         if (geom) {
             /* Bad geometry (bo taller than the capture, or the source image
              * over the texture limit): not a GPU fault. This frame is lost
              * and the caller rewrites it in software; the GPU path stays
              * enabled for valid surfaces. */
-            static int geom_warned;
-            if (!geom_warned++)
-                fprintf(stderr,
-                        "v4l2stateless: gpu: geometry refused (bo taller than "
-                        "capture, or image over the texture limit); software "
-                        "de-tile for this surface\n");
+            V4L2SL_LOG_LIMITED(&site_detile_fallback,
+                               "geometry refused; software de-tile\n");
         } else if (transient) {
             /* Cache miss with no fd: the entry was evicted between the
              * sources_ready check and this job. Keep the GPU path enabled --
              * the next frame re-exports and recovers. This frame is lost. */
-            fprintf(stderr,
-                    "v4l2stateless: gpu: transient source miss (y=%d u=%d); "
-                    "frame lost, GPU path kept\n", y_fd, uv_fd);
+            V4L2SL_LOG_LIMITED(&site_detile_fallback,
+                               "transient source miss (y=%d u=%d); "
+                               "frame lost, GPU path kept\n", y_fd, uv_fd);
         } else {
             /* One strike: the session drops to the software de-tile, and the
-             * caller rewrites this same bo synchronously. */
+             * caller rewrites this same bo synchronously. Rare and serious,
+             * so it is counted but printed unconditionally, not rate-limited. */
             g_gpu_failed = 1;
+            v4l2sl_logsite_count(&site_detile_fallback);
             if (g_gpu.state > 0)
-                fprintf(stderr, "v4l2stateless: de-tile HW->SW (gpu job failed; "
-                                "software de-tile from now on)\n");
+                v4l2sl_log("de-tile HW->SW (gpu job failed; software de-tile "
+                           "from now on)\n");
         }
     }
 out:

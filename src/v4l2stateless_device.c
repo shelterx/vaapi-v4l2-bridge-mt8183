@@ -29,8 +29,19 @@
 
 #include "v4l2stateless.h"
 #include "v4l2stateless_probe.h"
+#include "v4l2sl_logsite.h"
 
 static v4l2sl_ioctl_fn g_ioctl_hook;
+
+/* Failure-log sites for this translation unit (see v4l2sl_logsite.h). */
+V4L2SL_LOGSITE(site_qbuf_failed, "qbuf-failed");
+V4L2SL_LOGSITE_REG(site_qbuf_failed);
+V4L2SL_LOGSITE(site_pool_grow, "pool-grow");
+V4L2SL_LOGSITE_REG(site_pool_grow);
+V4L2SL_LOGSITE(site_pool_grow_failed, "pool-grow-failed");
+V4L2SL_LOGSITE_REG(site_pool_grow_failed);
+V4L2SL_LOGSITE(site_decode_error, "decode-error");
+V4L2SL_LOGSITE_REG(site_decode_error);
 
 /* filled by decode_submit, consumed by the matching pull_capture */
 static double g_prof_pending_decode = -1;
@@ -729,10 +740,9 @@ static int decode_submit_inner(struct v4l2sl_context *ctx, int out_buf_idx,
              * via the shared tail, and report -2 ("skipped") — callers mark
              * the surface instead of failing the vaEndPicture entrypoint
              * (Chrome caches VA-API failures for the whole session). */
-            if (v4l2sl_debug)
-                fprintf(stderr,
-                        "v4l2stateless: capture buf[%d] V4L2_BUF_FLAG_ERROR -> skip\n",
-                        done_cap);
+            V4L2SL_LOG_LIMITED(&site_decode_error,
+                               "capture buf[%d] V4L2_BUF_FLAG_ERROR -> skip\n",
+                               done_cap);
             v4l2sl_cap_pool_push(ctx, done_cap);
             done_cap = -2;
         }
@@ -1308,7 +1318,8 @@ int v4l2sl_queue_capture(struct v4l2sl_context *ctx, int buf_index,
         v4l2sl_gpu_wait_capture(ctx, buf_index);
 
     if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
-        fprintf(stderr, "v4l2stateless: QBUF capture[%d] failed: %s\n", buf_index, strerror(errno));
+        V4L2SL_LOG_LIMITED(&site_qbuf_failed, "QBUF capture[%d] failed: %s\n",
+                           buf_index, strerror(errno));
         return -1;
     }
 
@@ -2060,9 +2071,10 @@ static int v4l2sl_grow_capture_pool(struct v4l2sl_context *ctx)
     if (xioctl(ctx->v4l2_fd, VIDIOC_CREATE_BUFS, &create) < 0) {
         create.flags = 0;
         if (xioctl(ctx->v4l2_fd, VIDIOC_CREATE_BUFS, &create) < 0) {
-            fprintf(stderr, "v4l2stateless: capture pool grow %d->%d failed: %s%s\n",
-                    old_n, want, strerror(errno),
-                    errno == ENOBUFS ? " (queue buffer max reached)" : "");
+            V4L2SL_LOG_LIMITED(&site_pool_grow_failed,
+                               "capture pool grow %d->%d failed: %s%s\n",
+                               old_n, want, strerror(errno),
+                               errno == ENOBUFS ? " (queue buffer max reached)" : "");
             return 0;
         }
     }
@@ -2076,9 +2088,9 @@ static int v4l2sl_grow_capture_pool(struct v4l2sl_context *ctx)
     for (i = 0; i < created; i++)
         v4l2sl_cap_pool_push(ctx, (int)create.index + i);
     ctx->capture_bufs_allocd = (int)create.index + created;
-    fprintf(stderr, "v4l2stateless: capture pool grew %d -> %d (asked +%d, "
-                    "got +%d)\n",
-            old_n, ctx->capture_bufs_allocd, want - old_n, created);
+    V4L2SL_LOG_LIMITED(&site_pool_grow,
+                       "capture pool grew %d -> %d (asked +%d, got +%d)\n",
+                       old_n, ctx->capture_bufs_allocd, want - old_n, created);
     return created;
 }
 
