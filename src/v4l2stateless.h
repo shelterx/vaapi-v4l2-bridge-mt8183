@@ -257,6 +257,10 @@ struct v4l2sl_context {
      * non-contiguous CMA blocks, so the UV plane is mapped at its own offset
      * and de-tiled from this second pointer. NULL for single-plane formats. */
     void *capture_uv_ptr[V4L2SL_MAX_CAPTURE_BUFS];
+    /* Serialises the lazy CPU mapping of capture slots: the decode thread and
+     * the async de-tile worker (which maps a slot only to redo a failed
+     * hardware job in software) can both ask for the same slot. */
+    pthread_mutex_t cap_map_lock;
     uint32_t capture_uv_size;
     int capture_buf_anon; /* calloc stub when ioctl hook is installed */
     int free_cap_bufs[V4L2SL_MAX_CAPTURE_BUFS];
@@ -471,8 +475,18 @@ int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
 /* Async variant (V4L2SL_DETILE_ASYNC=1): starts the de-tile on a worker
  * thread and returns. v4l2sl_gbm_detile_wait() joins the pending job; call it
  * before freeing/reusing the capture slot or the bo. */
+/* y_fd/uv_fd: the capture planes as dma-bufs (-1/-1 when the GPU already
+ * holds them). slot/stride/alh describe the same capture slot so that, if the
+ * hardware job fails, the worker can redo this frame in software instead of
+ * leaving the bo with the previous picture. */
 int v4l2sl_gbm_detile_async_hw(struct v4l2sl_context *ctx,
-                               struct v4l2sl_surface *s, int y_fd, int uv_fd);
+                               struct v4l2sl_surface *s, int y_fd, int uv_fd,
+                               int slot, uint32_t stride, uint32_t alh);
+
+/* CPU view of a tiled capture slot (Y and UV planes), mapped on first use.
+ * Safe to call from the async worker. Returns 0 on success. */
+int v4l2sl_capture_cpu_view(struct v4l2sl_context *ctx, int index,
+                            const uint8_t **y, const uint8_t **uv);
 int v4l2sl_gbm_surface_detile_async(struct v4l2sl_surface *s,
                                     const uint8_t *ysrc, const uint8_t *usrc,
                                     uint32_t aw, uint32_t ah);

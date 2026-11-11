@@ -314,6 +314,15 @@ struct async_detile {
     struct v4l2sl_context *ctx;
     int y_fd;
     int uv_fd;
+    /* Recovery: the capture slot and geometry of a hardware job. If the
+     * engine fails, the worker redoes this frame in software from the slot
+     * (which the surface keeps until its next decode, and every reuse path
+     * joins this job first), so a failed job no longer leaves the bo
+     * holding the previous picture. rslot < 0: nothing to recover from. */
+    int rslot;
+    uint32_t rstride;
+    uint32_t ralh;
+    int recovered;
 };
 
 static struct async_detile g_adetile;
@@ -362,6 +371,19 @@ static void *async_detile_main(void *arg)
         else
             a->ok = v4l2sl_mdp3_detile_prepared(a->ctx, a->surf,
                                                 a->y_fd, a->uv_fd) == 0;
+        if (!a->ok && a->rslot >= 0) {
+            /* The engine failed (and has stopped writing the bo: the GPU
+             * path waits for its own fence, MDP3 resets its streams). The
+             * frame was already reported as decoded, so redo it here. */
+            const uint8_t *ysrc, *usrc;
+
+            if (v4l2sl_capture_cpu_view(a->ctx, a->rslot, &ysrc, &usrc) == 0 &&
+                v4l2sl_gbm_surface_detile_mm21(a->surf, ysrc, usrc,
+                                               a->rstride, a->ralh) == 0) {
+                a->ok = 1;
+                a->recovered = 1;
+            }
+        }
     } else {
         a->ok = v4l2sl_gbm_surface_detile_mm21(a->surf, a->ysrc, a->usrc,
                                               a->aw, a->ah) == 0;
@@ -402,6 +424,15 @@ static void detile_join_locked(void)
                     "v4l2stateless: async wait blocked %.1f ms\n", waited);
     }
     g_adetile.active = 0;
+    if (g_adetile.ok && g_adetile.recovered) {
+        static int n;
+
+        g_adetile.recovered = 0;
+        if (n++ < 5)
+            fprintf(stderr,
+                    "v4l2stateless: hardware de-tile job failed; frame redone "
+                    "in software%s\n", n == 5 ? " (further reports muted)" : "");
+    }
     if (!g_adetile.ok) {
         g_adetile.failed_once = 1;
         fprintf(stderr,
@@ -433,7 +464,8 @@ int v4l2sl_gbm_detile_pending_for(const struct v4l2sl_surface *s)
  * Takes ownership of both fds. -1/-1 means the GL side already holds the
  * planes for this slot (cache hit) and no fds should be exported. */
 int v4l2sl_gbm_detile_async_hw(struct v4l2sl_context *ctx,
-                               struct v4l2sl_surface *s, int y_fd, int uv_fd)
+                               struct v4l2sl_surface *s, int y_fd, int uv_fd,
+                               int slot, uint32_t stride, uint32_t alh)
 {
     int rc;
 
@@ -450,12 +482,17 @@ int v4l2sl_gbm_detile_async_hw(struct v4l2sl_context *ctx,
     g_adetile.surf = s;
     g_adetile.y_fd = y_fd;
     g_adetile.uv_fd = uv_fd;
+    g_adetile.rslot = slot;
+    g_adetile.rstride = stride;
+    g_adetile.ralh = alh;
+    g_adetile.recovered = 0;
     g_adetile.ok = 0;
     rc = pthread_create(&g_adetile.th, NULL, async_detile_main, &g_adetile);
     if (rc == 0) {
         g_adetile.active = 1;
     } else {
         g_adetile.hw = 0;
+        g_adetile.rslot = -1;
     }
     pthread_mutex_unlock(&g_adetile_lock);
     return rc == 0 ? 0 : -1;
@@ -482,6 +519,8 @@ int v4l2sl_gbm_surface_detile_async(struct v4l2sl_surface *s,
     g_adetile.ctx = NULL;
     g_adetile.y_fd = -1;
     g_adetile.uv_fd = -1;
+    g_adetile.rslot = -1;
+    g_adetile.recovered = 0;
     g_adetile.surf = s;
     g_adetile.ysrc = ysrc;
     g_adetile.usrc = usrc;

@@ -1102,7 +1102,7 @@ static void v4l2sl_unmap_capture_buffers(struct v4l2sl_context *ctx)
     ctx->capture_buf_anon = 0;
 }
 
-static int v4l2sl_mmap_one_capture(struct v4l2sl_context *ctx, int index)
+static int v4l2sl_mmap_one_capture_locked(struct v4l2sl_context *ctx, int index)
 {
     struct v4l2_buffer buf = { 0 };
     struct v4l2_plane planes[VIDEO_MAX_PLANES] = { 0 };
@@ -1171,6 +1171,43 @@ static int v4l2sl_mmap_one_capture(struct v4l2sl_context *ctx, int index)
     ctx->capture_uv_size = uv_len;
     ctx->capture_buf_anon = anon;
     return 0;
+}
+
+/* Both the decode thread and the async de-tile worker can ask for a slot's
+ * CPU mapping, so the (idempotent) mapping is serialised per context. */
+static int v4l2sl_mmap_one_capture(struct v4l2sl_context *ctx, int index)
+{
+    int rc;
+
+    if (!ctx)
+        return -1;
+    pthread_mutex_lock(&ctx->cap_map_lock);
+    rc = v4l2sl_mmap_one_capture_locked(ctx, index);
+    pthread_mutex_unlock(&ctx->cap_map_lock);
+    return rc;
+}
+
+int v4l2sl_capture_cpu_view(struct v4l2sl_context *ctx, int index,
+                            const uint8_t **y, const uint8_t **uv)
+{
+    int rc;
+
+    if (!ctx || !y || !uv || index < 0 || index >= V4L2SL_MAX_CAPTURE_BUFS)
+        return -1;
+    pthread_mutex_lock(&ctx->cap_map_lock);
+    rc = v4l2sl_mmap_one_capture_locked(ctx, index);
+    if (rc == 0 &&
+        (!ctx->capture_buf_ptr[index] ||
+         ctx->capture_buf_ptr[index] == MAP_FAILED ||
+         !ctx->capture_uv_ptr[index] ||
+         ctx->capture_uv_ptr[index] == MAP_FAILED))
+        rc = -1;
+    if (rc == 0) {
+        *y = ctx->capture_buf_ptr[index];
+        *uv = ctx->capture_uv_ptr[index];
+    }
+    pthread_mutex_unlock(&ctx->cap_map_lock);
+    return rc;
 }
 
 /*
@@ -1522,7 +1559,8 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
          * for the session and the software de-tile below rewrites the bo.
          */
         if (surf->gbm_bo && !ctx->mdp3.disabled &&
-            v4l2sl_detile_mode() == V4L2SL_DETILE_GPU) {
+            v4l2sl_detile_mode() == V4L2SL_DETILE_GPU &&
+            v4l2sl_gpu_usable()) {
             /*
              * GPU de-tile: same dma-buf handoff as MDP3, different engine.
              * The shader caches one EGLImage per (slot, plane), so the planes
@@ -1539,8 +1577,9 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
 
             if (cached || uv_fd >= 0) {
                 if (v4l2sl_gbm_detile_async_wanted()) {
-                    if (v4l2sl_gbm_detile_async_hw(ctx, surf, y_fd,
-                                                   uv_fd) == 0) {
+                    if (v4l2sl_gbm_detile_async_hw(ctx, surf, y_fd, uv_fd,
+                                                   buf_index, stride,
+                                                   alh) == 0) {
                         g_prof_pending_detile = 0.0;
                         surf->last_writer = V4L2SL_WRITER_BO;
                         return 0;
@@ -1591,7 +1630,9 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
                                 : -1;
 
                 if (uv_fd >= 0 &&
-                    v4l2sl_gbm_detile_async_hw(ctx, surf, y_fd, uv_fd) == 0) {
+                    v4l2sl_gbm_detile_async_hw(ctx, surf, y_fd, uv_fd,
+                                               buf_index, stride,
+                                               alh) == 0) {
                     g_prof_pending_detile = 0.0;
                     surf->last_writer = V4L2SL_WRITER_BO;
                     return 0;
