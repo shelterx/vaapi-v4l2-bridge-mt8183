@@ -103,7 +103,7 @@ int v4l2sl_gbm_surface_upload(struct v4l2sl_surface *s, const void *src,
         return -1;
     /* vaPutImage / sync() write the same bo a pending de-tile may be
      * writing; join first so the two never interleave. */
-    v4l2sl_gbm_detile_wait();
+    v4l2sl_gbm_detile_wait(s->capture_owner);
     dst = gbm_bo_map(s->gbm_bo, 0, 0, w, uv + (uv + 1) / 2,
                      GBM_BO_TRANSFER_WRITE, &mstride, &map_data);
     if (!dst) {
@@ -130,7 +130,7 @@ int v4l2sl_surface_ensure_memfd(struct v4l2sl_surface *s)
 
     if (!s || !v4l2sl_memfd_stale(s) || !s->gbm_bo)
         return 0;
-    v4l2sl_gbm_detile_wait();   /* bo may still be written by a pending job */
+    v4l2sl_gbm_detile_wait(s->capture_owner);   /* bo may still be written */
     v4l2sl_gpu_wait_surface(s); /* ... and the GPU may still be rendering it */
     if (s->memfd_fd < 0 || !s->stride || !s->aligned_h)
         return -1;
@@ -297,43 +297,17 @@ static void detile_planes_to(const uint8_t *ysrc, const uint8_t *usrc,
 /*
  * Asynchronous de-tile (V4L2SL_DETILE_ASYNC=1): the MM21 -> NV12 pass runs on
  * a worker thread so it overlaps the *next* decode instead of extending the
- * current frame's critical path. Only one job is in flight (the decoder is
- * serialized); the next pull waits for it, by which time it has had a whole
- * decode (~9 ms) to finish.
+ * current frame's critical path. One job is in flight *per context*; the next
+ * pull of that context waits for it, by which time it has had a whole decode
+ * (~9 ms) to finish.
  *
  * The job reads the surface's capture slot and writes its GBM bo, so every
- * path that can free/reuse either must call v4l2sl_gbm_detile_wait() first:
+ * path that can free/reuse either must call v4l2sl_gbm_detile_wait(ctx) first:
  * context release, capture renegotiation, decode reset, surface destroy,
  * memfd refill, export, and vaSyncSurface.
  */
-struct async_detile {
-    pthread_t th;
-    int active;
-    int ok;
-    int failed_once;
-    struct v4l2sl_surface *surf;
-    const uint8_t *ysrc;
-    const uint8_t *usrc;
-    uint32_t aw;
-    uint32_t ah;
-    /* Hardware (MDP3) job: decoder capture dma-bufs, exported by the caller. */
-    int hw;
-    struct v4l2sl_context *ctx;
-    int y_fd;
-    int uv_fd;
-    /* Recovery: the capture slot and geometry of a hardware job. If the
-     * engine fails, the worker redoes this frame in software from the slot
-     * (which the surface keeps until its next decode, and every reuse path
-     * joins this job first), so a failed job no longer leaves the bo
-     * holding the previous picture. rslot < 0: nothing to recover from. */
-    int rslot;
-    uint32_t rstride;
-    uint32_t ralh;
-    int recovered;
-};
-
-static struct async_detile g_adetile;
-static pthread_mutex_t g_adetile_lock = PTHREAD_MUTEX_INITIALIZER;
+/* The job itself lives on the context (struct v4l2sl_async_detile): one job in
+ * flight per stream, so a slow engine cannot serialise the others. */
 static double g_last_wait_ms;
 static double g_last_job_wall_ms;
 static double g_last_job_cpu_ms;
@@ -364,7 +338,7 @@ static double ts_ms(const struct timespec *a, const struct timespec *b)
 
 static void *async_detile_main(void *arg)
 {
-    struct async_detile *a = arg;
+    struct v4l2sl_async_detile *a = arg;
     struct timespec w0, w1, c0, c1;
     double wall, cpu;
 
@@ -419,18 +393,18 @@ static void *async_detile_main(void *arg)
     return NULL;
 }
 
-/* Join the in-flight job. The caller must hold g_adetile_lock; the worker
+/* Join this slot's in-flight job. The caller must hold a->lock; the worker
  * never takes it (it only touches the capture maps and the bo), so joining
  * under the lock is safe and makes wait+create atomic across contexts. */
-static void detile_join_locked(void)
+static void detile_join_locked(struct v4l2sl_async_detile *a)
 {
     struct timespec w0, w1;
     double waited;
 
-    if (!g_adetile.active)
+    if (!a || !a->active)
         return;
     clock_gettime(CLOCK_MONOTONIC, &w0);
-    pthread_join(g_adetile.th, NULL);
+    pthread_join(a->th, NULL);
     clock_gettime(CLOCK_MONOTONIC, &w1);
     waited = ts_ms(&w0, &w1);
     if (waited > 0.5 && getenv("V4L2SL_PROFILE")) {
@@ -439,39 +413,48 @@ static void detile_join_locked(void)
             fprintf(stderr,
                     "v4l2stateless: async wait blocked %.1f ms\n", waited);
     }
-    g_adetile.active = 0;
-    if (g_adetile.ok && g_adetile.recovered) {
+    a->active = 0;
+    if (a->ok && a->recovered) {
         static int n;
 
-        g_adetile.recovered = 0;
+        a->recovered = 0;
         if (n++ < 5)
             fprintf(stderr,
                     "v4l2stateless: hardware de-tile job failed; frame redone "
                     "in software%s\n", n == 5 ? " (further reports muted)" : "");
     }
-    if (!g_adetile.ok) {
-        g_adetile.failed_once = 1;
+    if (!a->ok) {
+        a->failed_once = 1;
         fprintf(stderr,
                 "v4l2stateless: async de-tile job failed; using the "
                 "synchronous path from now on\n");
     }
 }
 
-void v4l2sl_gbm_detile_wait(void)
+void v4l2sl_gbm_detile_wait(struct v4l2sl_context *ctx)
 {
-    pthread_mutex_lock(&g_adetile_lock);
-    detile_join_locked();
-    pthread_mutex_unlock(&g_adetile_lock);
+    struct v4l2sl_async_detile *a;
+
+    if (!ctx)
+        return;
+    a = &ctx->adetile;
+    pthread_mutex_lock(&a->lock);
+    detile_join_locked(a);
+    pthread_mutex_unlock(&a->lock);
 }
 
-/* True when the in-flight job is reading this surface's capture slot. */
+/* True when this surface's context has a de-tile job reading its slot. */
 int v4l2sl_gbm_detile_pending_for(const struct v4l2sl_surface *s)
 {
+    struct v4l2sl_async_detile *a;
     int r;
 
-    pthread_mutex_lock(&g_adetile_lock);
-    r = g_adetile.active && g_adetile.surf == s;
-    pthread_mutex_unlock(&g_adetile_lock);
+    if (!s || !s->capture_owner)
+        return 0;
+    a = &s->capture_owner->adetile;
+    pthread_mutex_lock(&a->lock);
+    r = a->active && a->surf == s;
+    pthread_mutex_unlock(&a->lock);
     return r;
 }
 
@@ -485,32 +468,35 @@ int v4l2sl_gbm_detile_async_hw(struct v4l2sl_context *ctx,
 {
     int rc;
 
+    struct v4l2sl_async_detile *a;
+
     if (!ctx || !s || !s->gbm_bo || (y_fd < 0) != (uv_fd < 0))
         return -1;
-    pthread_mutex_lock(&g_adetile_lock);
-    detile_join_locked();
-    if (g_adetile.failed_once) {
-        pthread_mutex_unlock(&g_adetile_lock);
+    a = &ctx->adetile;
+    pthread_mutex_lock(&a->lock);
+    detile_join_locked(a);
+    if (a->failed_once) {
+        pthread_mutex_unlock(&a->lock);
         return -1;
     }
-    g_adetile.hw = 1;
-    g_adetile.ctx = ctx;
-    g_adetile.surf = s;
-    g_adetile.y_fd = y_fd;
-    g_adetile.uv_fd = uv_fd;
-    g_adetile.rslot = slot;
-    g_adetile.rstride = stride;
-    g_adetile.ralh = alh;
-    g_adetile.recovered = 0;
-    g_adetile.ok = 0;
-    rc = pthread_create(&g_adetile.th, NULL, async_detile_main, &g_adetile);
+    a->hw = 1;
+    a->ctx = ctx;
+    a->surf = s;
+    a->y_fd = y_fd;
+    a->uv_fd = uv_fd;
+    a->rslot = slot;
+    a->rstride = stride;
+    a->ralh = alh;
+    a->recovered = 0;
+    a->ok = 0;
+    rc = pthread_create(&a->th, NULL, async_detile_main, a);
     if (rc == 0) {
-        g_adetile.active = 1;
+        a->active = 1;
     } else {
-        g_adetile.hw = 0;
-        g_adetile.rslot = -1;
+        a->hw = 0;
+        a->rslot = -1;
     }
-    pthread_mutex_unlock(&g_adetile_lock);
+    pthread_mutex_unlock(&a->lock);
     return rc == 0 ? 0 : -1;
 }
 
@@ -520,33 +506,35 @@ int v4l2sl_gbm_surface_detile_async(struct v4l2sl_surface *s,
 {
     int rc;
 
-    if (!s || !s->gbm_bo || !ysrc || !usrc)
+    struct v4l2sl_async_detile *a;
+
+    if (!s || !s->gbm_bo || !ysrc || !usrc || !s->capture_owner)
         return -1;
-    pthread_mutex_lock(&g_adetile_lock);
-    /* Finish the previous job first: the caller's frame N-1 was displayed
-     * with that bo, and its capture slot may be reused. Joined under the
-     * lock so a second context cannot start a job in between. */
-    detile_join_locked();
-    if (g_adetile.failed_once) {
-        pthread_mutex_unlock(&g_adetile_lock);
+    a = &s->capture_owner->adetile;
+    pthread_mutex_lock(&a->lock);
+    /* Finish this stream's previous job first: the caller's frame N-1 was
+     * displayed with that bo, and its capture slot may be reused. */
+    detile_join_locked(a);
+    if (a->failed_once) {
+        pthread_mutex_unlock(&a->lock);
         return -1;
     }
-    g_adetile.hw = 0;
-    g_adetile.ctx = NULL;
-    g_adetile.y_fd = -1;
-    g_adetile.uv_fd = -1;
-    g_adetile.rslot = -1;
-    g_adetile.recovered = 0;
-    g_adetile.surf = s;
-    g_adetile.ysrc = ysrc;
-    g_adetile.usrc = usrc;
-    g_adetile.aw = aw;
-    g_adetile.ah = ah;
-    g_adetile.ok = 0;
-    rc = pthread_create(&g_adetile.th, NULL, async_detile_main, &g_adetile);
+    a->hw = 0;
+    a->ctx = s->capture_owner;
+    a->y_fd = -1;
+    a->uv_fd = -1;
+    a->rslot = -1;
+    a->recovered = 0;
+    a->surf = s;
+    a->ysrc = ysrc;
+    a->usrc = usrc;
+    a->aw = aw;
+    a->ah = ah;
+    a->ok = 0;
+    rc = pthread_create(&a->th, NULL, async_detile_main, a);
     if (rc == 0)
-        g_adetile.active = 1;
-    pthread_mutex_unlock(&g_adetile_lock);
+        a->active = 1;
+    pthread_mutex_unlock(&a->lock);
     return rc == 0 ? 0 : -1;
 }
 
@@ -598,7 +586,7 @@ int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
 
 void v4l2sl_gbm_surface_destroy(struct v4l2sl_surface *s)
 {
-    v4l2sl_gbm_detile_wait();
+    v4l2sl_gbm_detile_wait(s->capture_owner);
     /* The bo is about to be freed; the GPU may still be rendering into it. */
     v4l2sl_gpu_wait_surface(s);
     v4l2sl_gpu_forget_surface(s);
@@ -618,7 +606,7 @@ VAStatus v4l2sl_surface_fill_prime_gbm(const struct v4l2sl_surface *surf,
 
     if (!surf || !surf->gbm_bo || !descriptor)
         return VA_STATUS_ERROR_INVALID_SURFACE;
-    v4l2sl_gbm_detile_wait();   /* hand out the bo only when fully written */
+    v4l2sl_gbm_detile_wait(surf->capture_owner);   /* hand out a finished bo */
     fd = gbm_bo_get_fd_for_plane(surf->gbm_bo, 0);
     if (fd < 0)
         return VA_STATUS_ERROR_OPERATION_FAILED;

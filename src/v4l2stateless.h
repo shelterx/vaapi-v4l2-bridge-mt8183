@@ -233,6 +233,41 @@ enum v4l2sl_detile_mode v4l2sl_detile_resolve(struct v4l2sl_context *ctx);
  * v4l2sl_mdp3_fini(ctx), even if the hardware path later disables itself. */
 int v4l2sl_mdp3_claim(struct v4l2sl_context *ctx);
 
+/*
+ * One in-flight asynchronous de-tile job, per decode context.
+ *
+ * It lives on the context rather than in a file-static so streams cannot wait
+ * on each other: a 10 ms MDP3 job would otherwise serialise every other
+ * stream's hand-off - and, because the pull runs on the decode thread, their
+ * decode as well. The engines still serialise themselves (one GL thread, one
+ * m2m), which is where the hardware limit actually is.
+ */
+struct v4l2sl_async_detile {
+    pthread_mutex_t lock;
+    pthread_t th;
+    int active;             /* job posted, not yet joined */
+    int ok;                 /* job succeeded, or was recovered in software */
+    int failed_once;        /* async path unusable for this context */
+    struct v4l2sl_context *ctx;
+    struct v4l2sl_surface *surf;
+    const uint8_t *ysrc;    /* software job: capture planes */
+    const uint8_t *usrc;
+    uint32_t aw;
+    uint32_t ah;
+    int hw;                 /* hardware job (GPU or MDP3) */
+    int y_fd;
+    int uv_fd;
+    /* Recovery: the capture slot and geometry of a hardware job. If the engine
+     * fails, the worker redoes this frame in software from the slot (which the
+     * surface keeps until its next decode, and every reuse path joins this job
+     * first), so a failed job no longer leaves the bo holding the previous
+     * picture. rslot < 0: nothing to recover from. */
+    int rslot;
+    uint32_t rstride;
+    uint32_t ralh;
+    int recovered;
+};
+
 /* Per-context state (one decode session) */
 struct v4l2sl_context {
     VAContextID context_id;
@@ -344,9 +379,10 @@ struct v4l2sl_context {
     struct v4l2sl_mdp3 mdp3;
     /* De-tile implementation of this context, fixed at creation from
      * v4l2sl_detile_mode(). Every per-frame decision reads this, not the
-     * global, so a context can later pick its own tier. Until then every
-     * context gets the process-wide mode and nothing changes. */
+     * global, so a context can pick its own tier. */
     enum v4l2sl_detile_mode detile;
+    /* This context's pending asynchronous de-tile job (one at a time). */
+    struct v4l2sl_async_detile adetile;
 };
 
 /* Driver global state */
@@ -524,7 +560,9 @@ int v4l2sl_gbm_surface_detile_async(struct v4l2sl_surface *s,
                                     const uint8_t *ysrc, const uint8_t *usrc,
                                     uint32_t aw, uint32_t ah);
 int v4l2sl_gbm_detile_async_wanted(void);
-void v4l2sl_gbm_detile_wait(void);
+/* Join this context's pending de-tile job. Every path that can free or reuse
+ * a capture slot or a bo must call it first with the owning context. */
+void v4l2sl_gbm_detile_wait(struct v4l2sl_context *ctx);
 /* Metrics of the most recent async job, for V4L2SL_TRACE. */
 double v4l2sl_gbm_detile_last_wait_ms(void);
 void v4l2sl_gbm_detile_last_job(double *wall_ms, double *cpu_ms);

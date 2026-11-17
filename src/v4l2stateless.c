@@ -228,6 +228,7 @@ v4l2sl_terminate(VADriverContextP ctx)
         free(context->device_path);
         free(context->render_targets);
         pthread_mutex_destroy(&context->cap_map_lock);
+        pthread_mutex_destroy(&context->adetile.lock);
         free(context);
     }
     /* Clients that terminate without destroying their surfaces (session
@@ -262,8 +263,8 @@ v4l2sl_terminate(VADriverContextP ctx)
     /* Every context and surface is gone, so nothing can start another GPU
      * job: join the GL thread and let it delete its EGL/GL state. Without
      * this the thread, its private EGLDisplay and every cached EGLImage
-     * outlive vaTerminate (they were only reclaimed at process exit). */
-    v4l2sl_gbm_detile_wait();
+     * outlive vaTerminate (they were only reclaimed at process exit). Each
+     * context already joined its own de-tile job in release_context_device. */
     v4l2sl_gpu_fini();
 
     /* One line with every non-zero failure counter; a clean run prints nothing. */
@@ -1142,6 +1143,11 @@ v4l2sl_create_context(VADriverContextP ctx,
         free(context);
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
+    if (pthread_mutex_init(&context->adetile.lock, NULL) != 0) {
+        pthread_mutex_destroy(&context->cap_map_lock);
+        free(context);
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
 
     pthread_mutex_lock(&g_v4l2sl_lock);
 
@@ -1154,6 +1160,7 @@ v4l2sl_create_context(VADriverContextP ctx,
     context->render_targets = calloc(num_render_targets, sizeof(VASurfaceID));
     if (!context->render_targets) {
         pthread_mutex_destroy(&context->cap_map_lock);
+        pthread_mutex_destroy(&context->adetile.lock);
         free(context);
         pthread_mutex_unlock(&g_v4l2sl_lock);
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
@@ -1170,6 +1177,7 @@ v4l2sl_create_context(VADriverContextP ctx,
         pthread_mutex_unlock(&g_v4l2sl_lock);
         free(context->render_targets);
         pthread_mutex_destroy(&context->cap_map_lock);
+        pthread_mutex_destroy(&context->adetile.lock);
         free(context);
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
@@ -1310,6 +1318,7 @@ fail:
     free(context->device_path);
     free(context->render_targets);
     pthread_mutex_destroy(&context->cap_map_lock);
+        pthread_mutex_destroy(&context->adetile.lock);
     free(context);
     if (v4l2sl_debug)
         fprintf(stderr, "v4l2stateless: create_context: ret=-5 (fail)\n");
@@ -1334,6 +1343,7 @@ v4l2sl_destroy_context(VADriverContextP ctx, VAContextID context_id)
             free(context->device_path);
             free(context->render_targets);
             pthread_mutex_destroy(&context->cap_map_lock);
+        pthread_mutex_destroy(&context->adetile.lock);
             free(context);
             pthread_mutex_unlock(&g_v4l2sl_lock);
             return VA_STATUS_SUCCESS;
@@ -1819,29 +1829,39 @@ v4l2sl_sync_surface(VADriverContextP ctx, VASurfaceID render_target)
 {
     struct v4l2sl_driver_data *driver_data = ctx->pDriverData;
     struct v4l2sl_surface *surface;
+    struct v4l2sl_context *own = NULL;
 
-    v4l2sl_gbm_detile_wait();
+    /* A sync is about one surface, so it waits for that surface's context
+     * only: joining another stream's de-tile job (or reaping its GPU fences)
+     * would serialise the streams, which is exactly what the per-context job
+     * slot exists to avoid. */
     pthread_mutex_lock(&g_v4l2sl_lock);
-    /* A sync request means "the frame is done": reap every context's live
-     * GPU fences (the old global table made this a single call). */
-    for (struct v4l2sl_context *c = driver_data->contexts; c; c = c->next)
-        v4l2sl_gpu_wait_pending(c);
     surface = v4l2sl_surface_by_id(driver_data, render_target);
+    if (surface)
+        own = surface->capture_owner;
+    pthread_mutex_unlock(&g_v4l2sl_lock);
+
     if (!surface) {
         if (v4l2sl_debug)
             fprintf(stderr, "v4l2stateless: sync lookup fail %#x\n",
                     render_target);
-        pthread_mutex_unlock(&g_v4l2sl_lock);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
+    v4l2sl_gbm_detile_wait(own);
+    if (own)
+        v4l2sl_gpu_wait_pending(own);
 
-    /* Decoding runs synchronously inside vaEndPicture (single request in
-     * flight), so by the time the client syncs, the frame — if it decoded —
-     * is already attached to the surface as a capture-buffer DMA-BUF. */
-    surface->status = VASurfaceReady;
-
+    pthread_mutex_lock(&g_v4l2sl_lock);
+    /* Re-look-up: the surface may have been destroyed while we waited. */
+    surface = v4l2sl_surface_by_id(driver_data, render_target);
+    if (surface) {
+        /* Decoding runs synchronously inside vaEndPicture (single request in
+         * flight), so by the time the client syncs, the frame — if it decoded
+         * — is already attached to the surface as a capture-buffer DMA-BUF. */
+        surface->status = VASurfaceReady;
+    }
     pthread_mutex_unlock(&g_v4l2sl_lock);
-    return VA_STATUS_SUCCESS;
+    return surface ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_INVALID_SURFACE;
 }
 
 static VAStatus

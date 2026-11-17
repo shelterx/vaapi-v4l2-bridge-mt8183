@@ -381,7 +381,7 @@ void v4l2sl_release_context_device(struct v4l2sl_context *ctx)
     if (!ctx)
         return;
 
-    v4l2sl_gbm_detile_wait();
+    v4l2sl_gbm_detile_wait(ctx);
     v4l2sl_gpu_wait_pending(ctx);
     v4l2sl_gpu_forget_capture(ctx);
 
@@ -489,7 +489,7 @@ static void rebuild_free_pools(struct v4l2sl_context *ctx)
 
 void v4l2sl_decode_reset(struct v4l2sl_context *ctx)
 {
-    v4l2sl_gbm_detile_wait();   /* capture slots are about to be recycled */
+    v4l2sl_gbm_detile_wait(ctx);   /* capture slots are about to be recycled */
     v4l2sl_gpu_wait_pending(ctx);  /* ... and the GPU may still be reading them */
     if (!ctx || ctx->v4l2_fd < 0)
         return;
@@ -683,7 +683,7 @@ static int decode_submit_inner(struct v4l2sl_context *ctx, int out_buf_idx,
      * stays intact for every other surface. */
     if (ctx->current_surface &&
         v4l2sl_gbm_detile_pending_for(ctx->current_surface))
-        v4l2sl_gbm_detile_wait();
+        v4l2sl_gbm_detile_wait(ctx);
 
     cap_buf_idx = -1;
     if (v4l2sl_expbuf_export_wanted() && ctx->current_surface &&
@@ -922,7 +922,7 @@ int v4l2sl_ensure_capture(struct v4l2sl_context *ctx, int width, int height,
         v4l2sl_av1_dpb_model_reset(ctx);
     }
 
-    v4l2sl_gbm_detile_wait();   /* pending de-tile reads a capture slot */
+    v4l2sl_gbm_detile_wait(ctx);   /* pending de-tile reads a capture slot */
     v4l2sl_gpu_wait_pending(ctx);  /* ... and the GPU may still read it */
     v4l2sl_gpu_forget_capture(ctx);  /* the pool's dma-bufs die below */
     release_ctx_capture_surfaces(ctx);
