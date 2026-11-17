@@ -114,6 +114,17 @@ test_detile_auto = executable('test_detile_auto',
 
 test('detile_auto', test_detile_auto)
 
+# A de-tile job belongs to one context. Software de-tile only, so no GPU or
+# display is needed; skips without a render node.
+test_detile_slots = executable('test_detile_slots',
+  files('tests/test_detile_slots.c'),
+  link_with: libv4l2sl_core,
+  include_directories: inc,
+  dependencies: [libva_dep, libdrm_dep, gbm_dep, thread_dep],
+)
+
+test('detile_slots', test_detile_slots)
+
 test_capture_cpu_view = executable('test_capture_cpu_view',
   files('tests/test_capture_cpu_view.c'),
   link_with: libv4l2sl_core,
