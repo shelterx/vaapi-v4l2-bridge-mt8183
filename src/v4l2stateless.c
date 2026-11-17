@@ -2457,9 +2457,31 @@ v4l2sl_export_surface_handle(VADriverContextP ctx, VASurfaceID surface_id,
      * tiled capture the raw plane cannot be EXPBUF'd as linear NV12, and Chrome
      * caches the imported dma-buf, so hand it a GBM bo that the de-tile fills.
      */
-    if (v4l2sl_expbuf_export_wanted() && c && c->v4l2_fd >= 0 &&
-        surf->buf_index < 0)
-        (void)v4l2sl_claim_capture_for_export(c, surf);
+    /*
+     * The queue has to exist so the negotiated geometry and fourcc are known -
+     * the bo is built from them - but a *tiled* capture is handed to the client
+     * as that bo, so the surface never needs a capture slot of its own.
+     * Claiming one per exported surface is what exhausted the decoder's
+     * capture queue: vb2 caps it at 32 buffers, Chromium exports its whole
+     * surface pool, and once the pool is larger the next export cannot claim
+     * ("claim capture: no free slot"), which surfaces later as "no free
+     * capture buffer" and a dead decoder. Only a linear capture, which is the
+     * EXPBUF path the client does sample, needs the surface's own slot.
+     */
+    if (v4l2sl_expbuf_export_wanted() && c && c->v4l2_fd >= 0) {
+        int w = c->width > 0 ? c->width : (int)surf->width;
+        int h = c->height > 0 ? c->height : (int)surf->height;
+
+        if (v4l2sl_ensure_capture(c, w, h, c->cap_pixelformat) == 0) {
+            if (c->cap_pixelformat != V4L2_PIX_FMT_MM21) {
+                if (surf->buf_index < 0)
+                    (void)v4l2sl_claim_capture_for_export(c, surf);
+            } else {
+                /* The bo layout is derived from the owning context. */
+                surf->capture_owner = c;
+            }
+        }
+    }
 
     if (surf->de_tiled || surf->cap_fourcc == V4L2_PIX_FMT_MM21 ||
         (c && c->cap_pixelformat == V4L2_PIX_FMT_MM21)) {
