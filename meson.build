@@ -18,6 +18,7 @@ libdrm_dep = dependency('libdrm', version: '>= 2.4.0')
 gbm_dep = dependency('gbm')
 egl_dep = dependency('egl')
 glesv2_dep = dependency('glesv2')
+thread_dep = dependency('threads')
 
 # Get the driver install directory from libva
 libva_driverdir = libva_dep.get_variable(pkgconfig: 'driverdir')
@@ -102,6 +103,25 @@ test_format = executable('test_format',
 )
 
 test('format', test_format)
+
+# Tier selection for V4L2SL_DETILE=auto. No hardware needed.
+test_detile_auto = executable('test_detile_auto',
+  files('tests/test_detile_auto.c'),
+  link_with: libv4l2sl_core,
+  include_directories: inc,
+  dependencies: [libva_dep, libdrm_dep, gbm_dep],
+)
+
+test('detile_auto', test_detile_auto)
+
+test_capture_cpu_view = executable('test_capture_cpu_view',
+  files('tests/test_capture_cpu_view.c'),
+  link_with: libv4l2sl_core,
+  include_directories: inc,
+  dependencies: [libva_dep, libdrm_dep, gbm_dep, thread_dep],
+)
+
+test('capture_cpu_view', test_capture_cpu_view)
 
 # Lifecycle test: no decoder, no video. It loads the built driver shared
 # object the same way libva does (LIBVA_DRIVERS_PATH makes libva open that
