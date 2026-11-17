@@ -1075,28 +1075,33 @@ int v4l2sl_get_capture_geometry(int fd, uint32_t *w, uint32_t *h,
 
 
 
+/* Drop one slot's CPU mapping. Caller holds cap_map_lock. */
+static void v4l2sl_unmap_one_capture_locked(struct v4l2sl_context *ctx, int i)
+{
+    if (ctx->capture_buf_ptr[i] && ctx->capture_buf_ptr[i] != MAP_FAILED) {
+        if (ctx->capture_buf_anon)
+            free(ctx->capture_buf_ptr[i]);
+        else
+            munmap(ctx->capture_buf_ptr[i], ctx->capture_buf_size);
+    }
+    ctx->capture_buf_ptr[i] = NULL;
+    if (ctx->capture_uv_ptr[i] && ctx->capture_uv_ptr[i] != MAP_FAILED) {
+        if (ctx->capture_buf_anon)
+            free(ctx->capture_uv_ptr[i]);
+        else
+            munmap(ctx->capture_uv_ptr[i], ctx->capture_uv_size);
+    }
+    ctx->capture_uv_ptr[i] = NULL;
+}
+
 static void v4l2sl_unmap_capture_buffers(struct v4l2sl_context *ctx)
 {
     int i;
 
     if (!ctx)
         return;
-    for (i = 0; i < V4L2SL_MAX_CAPTURE_BUFS; i++) {
-        if (ctx->capture_buf_ptr[i] && ctx->capture_buf_ptr[i] != MAP_FAILED) {
-            if (ctx->capture_buf_anon)
-                free(ctx->capture_buf_ptr[i]);
-            else
-                munmap(ctx->capture_buf_ptr[i], ctx->capture_buf_size);
-        }
-        ctx->capture_buf_ptr[i] = NULL;
-        if (ctx->capture_uv_ptr[i] && ctx->capture_uv_ptr[i] != MAP_FAILED) {
-            if (ctx->capture_buf_anon)
-                free(ctx->capture_uv_ptr[i]);
-            else
-                munmap(ctx->capture_uv_ptr[i], ctx->capture_uv_size);
-        }
-        ctx->capture_uv_ptr[i] = NULL;
-    }
+    for (i = 0; i < V4L2SL_MAX_CAPTURE_BUFS; i++)
+        v4l2sl_unmap_one_capture_locked(ctx, i);
     ctx->capture_buf_size = 0;
     ctx->capture_uv_size = 0;
     ctx->capture_buf_anon = 0;
@@ -1188,13 +1193,19 @@ static int v4l2sl_mmap_one_capture(struct v4l2sl_context *ctx, int index)
 }
 
 int v4l2sl_capture_cpu_view(struct v4l2sl_context *ctx, int index,
-                            const uint8_t **y, const uint8_t **uv)
+                            const uint8_t **y, const uint8_t **uv,
+                            int *created)
 {
     int rc;
 
     if (!ctx || !y || !uv || index < 0 || index >= V4L2SL_MAX_CAPTURE_BUFS)
         return -1;
     pthread_mutex_lock(&ctx->cap_map_lock);
+    /* The caller unmaps the slot again when this call built the mapping: the
+     * recovery path must not pin CMA for the life of the context, which the
+     * software de-tile path deliberately does. */
+    if (created)
+        *created = ctx->capture_buf_ptr[index] == NULL;
     rc = v4l2sl_mmap_one_capture_locked(ctx, index);
     if (rc == 0 &&
         (!ctx->capture_buf_ptr[index] ||
@@ -1208,6 +1219,15 @@ int v4l2sl_capture_cpu_view(struct v4l2sl_context *ctx, int index,
     }
     pthread_mutex_unlock(&ctx->cap_map_lock);
     return rc;
+}
+
+void v4l2sl_capture_cpu_release(struct v4l2sl_context *ctx, int index)
+{
+    if (!ctx || index < 0 || index >= V4L2SL_MAX_CAPTURE_BUFS)
+        return;
+    pthread_mutex_lock(&ctx->cap_map_lock);
+    v4l2sl_unmap_one_capture_locked(ctx, index);
+    pthread_mutex_unlock(&ctx->cap_map_lock);
 }
 
 /*
@@ -1556,7 +1576,10 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
          * exception: if the hardware job fails, the worker maps that capture
          * slot (v4l2sl_capture_cpu_view) to redo the frame in software, since
          * the frame was already reported as decoded. That mapping is
-         * serialised per context and only happens on the failure path.
+         * serialised per context, only happens on the failure path, and is
+         * transient: the slot is unmapped again unless it was already mapped
+         * (the software de-tile keeps its slots mapped, the hardware path must
+         * not pin CMA).
          *
          * GPU: the shader writes the bo and the job waits on the bo's write
          * fence before anyone can sample it. A failure disables the GPU path

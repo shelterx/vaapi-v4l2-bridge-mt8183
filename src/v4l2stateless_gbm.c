@@ -376,12 +376,19 @@ static void *async_detile_main(void *arg)
              * path waits for its own fence, MDP3 resets its streams). The
              * frame was already reported as decoded, so redo it here. */
             const uint8_t *ysrc, *usrc;
+            int created = 0;
 
-            if (v4l2sl_capture_cpu_view(a->ctx, a->rslot, &ysrc, &usrc) == 0 &&
-                v4l2sl_gbm_surface_detile_mm21(a->surf, ysrc, usrc,
-                                               a->rstride, a->ralh) == 0) {
-                a->ok = 1;
-                a->recovered = 1;
+            if (v4l2sl_capture_cpu_view(a->ctx, a->rslot, &ysrc, &usrc,
+                                        &created) == 0) {
+                if (v4l2sl_gbm_surface_detile_mm21(a->surf, ysrc, usrc,
+                                                   a->rstride, a->ralh) == 0) {
+                    a->ok = 1;
+                    a->recovered = 1;
+                }
+                /* Only drop the mapping if this recovery built it: the
+                 * software de-tile path owns its mappings for the session. */
+                if (created)
+                    v4l2sl_capture_cpu_release(a->ctx, a->rslot);
             }
         }
     } else {

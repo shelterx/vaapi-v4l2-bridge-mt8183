@@ -484,9 +484,13 @@ int v4l2sl_gbm_detile_async_hw(struct v4l2sl_context *ctx,
                                int slot, uint32_t stride, uint32_t alh);
 
 /* CPU view of a tiled capture slot (Y and UV planes), mapped on first use.
- * Safe to call from the async worker. Returns 0 on success. */
+ * Safe to call from the async worker. Returns 0 on success. *created is set
+ * when this call built the mapping, in which case the caller must call
+ * v4l2sl_capture_cpu_release() when done so a failure path cannot pin CMA. */
 int v4l2sl_capture_cpu_view(struct v4l2sl_context *ctx, int index,
-                            const uint8_t **y, const uint8_t **uv);
+                            const uint8_t **y, const uint8_t **uv,
+                            int *created);
+void v4l2sl_capture_cpu_release(struct v4l2sl_context *ctx, int index);
 int v4l2sl_gbm_surface_detile_async(struct v4l2sl_surface *s,
                                     const uint8_t *ysrc, const uint8_t *usrc,
                                     uint32_t aw, uint32_t ah);
