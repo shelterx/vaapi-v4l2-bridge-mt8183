@@ -170,10 +170,13 @@ int v4l2sl_surface_ensure_memfd(struct v4l2sl_surface *s)
  *
  * The software path keeps the visible layout (UV at stride*height), so its
  * behaviour — and every buffer already handed to Chromium — is unchanged. */
-/* Still the process-wide mode, not a context's: the bo layout is fixed when
- * the surface is created, before any context owns it. Both hardware tiers
- * write the same aligned layout, so this stays correct while every context
- * runs the global mode; a mixed hw/gpu/sw setup has to revisit it. */
+/* Deliberately the process-wide mode, not a context's: the bo layout is fixed
+ * when the surface is created, before any context owns it. Both hardware tiers
+ * write the same aligned layout and the software de-tiler writes whichever
+ * layout the bo has, because every reader and writer keys off bo_uv_rows()
+ * rather than assuming one. So tiers can be mixed (V4L2SL_DETILE=auto hands
+ * MDP3 to one context and gpu/sw to the others) without a per-surface tier.
+ * With auto this returns true, i.e. every surface gets the hardware layout. */
 static int hw_layout_requested(void)
 {
     return v4l2sl_detile_mode() != V4L2SL_DETILE_SW;

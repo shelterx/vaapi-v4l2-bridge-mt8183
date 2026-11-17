@@ -761,7 +761,10 @@ void v4l2sl_gpu_forget_surface(struct v4l2sl_surface *s)
 
 int v4l2sl_gpu_usable(void)
 {
-    return !g_gpu_failed;
+    /* state < 0: bring-up already failed (probe or first job). Cheap enough
+     * for the per-frame path; the probe is what makes the state known before
+     * a tier is chosen. */
+    return !g_gpu_failed && g_gpu.state >= 0;
 }
 
 static int gpu_job(struct v4l2sl_surface *s, int y_fd, int uv_fd);
@@ -875,15 +878,11 @@ static void *gpu_thread_main(void *arg)
     return NULL;
 }
 
-int v4l2sl_gpu_detile(struct v4l2sl_surface *s, int y_fd, int uv_fd)
+/* Post a job (s == NULL: a probe) to the GL thread and wait for it. Takes
+ * ownership of the fds when there are any. */
+static int gpu_dispatch(struct v4l2sl_surface *s, int y_fd, int uv_fd)
 {
     int rc;
-
-    /* -1/-1 means both planes are already imported for this slot: there is
-     * nothing to export and the caller owns no fds. */
-    if (!s || !s->gbm_bo || y_fd < -1 || uv_fd < -1 ||
-        (y_fd < 0) != (uv_fd < 0))
-        goto fail;
 
     pthread_mutex_lock(&g_req.lock);
     if (g_req.stopping) {
@@ -925,7 +924,7 @@ int v4l2sl_gpu_detile(struct v4l2sl_surface *s, int y_fd, int uv_fd)
         close(uv_fd);
     /* A/B escape hatch: block here (not in the GL thread, which holds the
      * lock) to reproduce the pre-pipelined handoff. */
-    if (getenv("V4L2SL_GPU_WAIT"))
+    if (s && getenv("V4L2SL_GPU_WAIT"))
         v4l2sl_gpu_wait_surface(s);
     return rc;
 fail:
@@ -936,6 +935,46 @@ fail:
     return -1;
 }
 
+int v4l2sl_gpu_detile(struct v4l2sl_surface *s, int y_fd, int uv_fd)
+{
+    /* -1/-1 means both planes are already imported for this slot: there is
+     * nothing to export and the caller owns no fds. */
+    if (!s || !s->gbm_bo || y_fd < -1 || uv_fd < -1 ||
+        (y_fd < 0) != (uv_fd < 0))
+        goto fail;
+    return gpu_dispatch(s, y_fd, uv_fd);
+fail:
+    if (y_fd >= 0)
+        close(y_fd);
+    if (uv_fd >= 0)
+        close(uv_fd);
+    return -1;
+}
+
+/*
+ * Is the GPU de-tile actually available here? Choosing a tier must not assume
+ * it: bring the path up on the GL thread exactly as the first job would, and
+ * cache the answer. Cheap after the first call, and it also warms the context,
+ * so a tier that is chosen is a tier that has proved it initialises.
+ */
+int v4l2sl_gpu_probe(void)
+{
+    int rc;
+
+    pthread_mutex_lock(&g_gpu_lock);
+    if (g_gpu.state > 0) {
+        rc = !g_gpu_failed;
+        pthread_mutex_unlock(&g_gpu_lock);
+        return rc;
+    }
+    if (g_gpu.state < 0) {
+        pthread_mutex_unlock(&g_gpu_lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&g_gpu_lock);
+    return gpu_dispatch(NULL, -1, -1) == 0;
+}
+
 /* One de-tile job. Runs on the persistent GL thread (see gpu_dispatch) so
  * the EGL/gallium per-thread state is paid once per process, not per frame:
  * a fresh thread costs ~1 ms of CPU, which alone would cancel the win over
@@ -944,6 +983,19 @@ static int gpu_job(struct v4l2sl_surface *s, int y_fd, int uv_fd)
 {
     struct timespec ts;
     double t0c;
+
+    if (!s) {
+        /* Probe: bring the path up (EGL display, context, shader) and report
+         * whether it works, without drawing. Called through the same GL thread
+         * as a real job so the context ends up current where the draws will
+         * happen; the answer is cached in g_gpu.state by gpu_init_locked(). */
+        int r;
+
+        pthread_mutex_lock(&g_gpu_lock);
+        r = gpu_init_locked() == 0 ? 0 : -1;
+        pthread_mutex_unlock(&g_gpu_lock);
+        return r;
+    }
 
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
     t0c = ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;

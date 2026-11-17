@@ -1151,7 +1151,6 @@ v4l2sl_create_context(VADriverContextP ctx,
     context->height = picture_height;
     context->num_render_targets = num_render_targets;
     context->request_fd = -1;
-    context->detile = v4l2sl_detile_mode();
     context->render_targets = calloc(num_render_targets, sizeof(VASurfaceID));
     if (!context->render_targets) {
         pthread_mutex_destroy(&context->cap_map_lock);
@@ -1202,6 +1201,10 @@ v4l2sl_create_context(VADriverContextP ctx,
         pthread_mutex_unlock(&g_v4l2sl_lock);
         return VA_STATUS_SUCCESS;
     }
+
+    /* Decode contexts only (the stateful ones never de-tile). From here every
+     * failure leaves through the fail label, which releases an MDP3 claim. */
+    context->detile = v4l2sl_detile_resolve(context);
 
     /* Open media device for request API (sysfs, not /dev/mediaN == videoN) */
     context->media_fd = v4l2sl_open_media_for_device(context->device_path);

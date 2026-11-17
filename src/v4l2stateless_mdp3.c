@@ -106,6 +106,11 @@ static void mdp3_stage_report(void)
  */
 static struct v4l2sl_mdp3 g_mdp3 = { .fd = -1 };
 static struct v4l2sl_context *g_mdp3_owner;
+/* Auto mode reserves MDP3 when a context is created, because the owner above
+ * is only set by the first MM21 frame and two contexts created back to back
+ * would both think it was free. Guarded by g_mdp3_lock; released in
+ * v4l2sl_mdp3_fini(). */
+static struct v4l2sl_context *g_mdp3_claim;
 /* Two decode contexts can pull their first frame concurrently. Without this
  * lock both would open the m2m device and reconfigure it under each other,
  * which corrupts the stream that initialised first. */
@@ -640,9 +645,26 @@ int v4l2sl_mdp3_detile(struct v4l2sl_context *ctx, int buf_index,
     return v4l2sl_mdp3_detile_prepared(ctx, surf, y_fd, uv_fd);
 }
 
+int v4l2sl_mdp3_claim(struct v4l2sl_context *ctx)
+{
+    int got = 0;
+
+    if (!ctx)
+        return 0;
+    pthread_mutex_lock(&g_mdp3_lock);
+    if (!g_mdp3_claim || g_mdp3_claim == ctx) {
+        g_mdp3_claim = ctx;
+        got = 1;
+    }
+    pthread_mutex_unlock(&g_mdp3_lock);
+    return got;
+}
+
 void v4l2sl_mdp3_fini(struct v4l2sl_context *ctx)
 {
     pthread_mutex_lock(&g_mdp3_lock);
+    if (ctx && g_mdp3_claim == ctx)
+        g_mdp3_claim = NULL;
     if (ctx && g_mdp3.fd >= 0 && g_mdp3_owner == ctx) {
         mdp3_release_locked();
         /* Safe here and only here: the caller has already joined the async

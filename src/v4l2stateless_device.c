@@ -68,6 +68,29 @@ enum v4l2sl_detile_mode v4l2sl_detile_mode(void)
         return V4L2SL_DETILE_MDP3;
     if (e[0] == 'g' || e[0] == 'G')
         return V4L2SL_DETILE_GPU;
+    if (e[0] == 'a' || e[0] == 'A')
+        return V4L2SL_DETILE_AUTO;
+    return V4L2SL_DETILE_SW;
+}
+
+enum v4l2sl_detile_mode v4l2sl_detile_resolve(struct v4l2sl_context *ctx)
+{
+    enum v4l2sl_detile_mode m = v4l2sl_detile_mode();
+
+    if (m != V4L2SL_DETILE_AUTO)
+        return m;
+    if (v4l2sl_mdp3_claim(ctx)) {
+        m = V4L2SL_DETILE_MDP3;
+        fprintf(stderr, "v4l2stateless: de-tile tier = hw (auto, MDP3 claimed)\n");
+        return m;
+    }
+    /* Do not assume the GPU works: bring it up once and cache the answer. */
+    if (v4l2sl_gpu_probe()) {
+        m = V4L2SL_DETILE_GPU;
+        fprintf(stderr, "v4l2stateless: de-tile tier = gpu (auto)\n");
+        return m;
+    }
+    fprintf(stderr, "v4l2stateless: de-tile tier = sw (auto, gpu unavailable)\n");
     return V4L2SL_DETILE_SW;
 }
 

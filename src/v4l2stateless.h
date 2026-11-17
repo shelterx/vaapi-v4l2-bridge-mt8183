@@ -217,8 +217,21 @@ enum v4l2sl_detile_mode {
     V4L2SL_DETILE_SW = 0,
     V4L2SL_DETILE_MDP3,
     V4L2SL_DETILE_GPU,
+    /* Selector only (V4L2SL_DETILE=auto): v4l2sl_detile_mode() may return it,
+     * ctx->detile never holds it. v4l2sl_detile_resolve() turns it into one
+     * of the three above when a context is created. */
+    V4L2SL_DETILE_AUTO,
 };
 enum v4l2sl_detile_mode v4l2sl_detile_mode(void);
+/* The concrete tier (sw, hw or gpu) for a new decode context. A forced mode
+ * is returned as is. Auto gives hw to the context that claims MDP3 (one at a
+ * time) and gpu to every other, or sw when the GPU path is unusable. There is
+ * no fallback between tiers yet: a context keeps its tier and falls back to sw
+ * on failure exactly as the forced modes do. */
+enum v4l2sl_detile_mode v4l2sl_detile_resolve(struct v4l2sl_context *ctx);
+/* Reserve MDP3 for ctx (true if ctx now holds it or already did). Held until
+ * v4l2sl_mdp3_fini(ctx), even if the hardware path later disables itself. */
+int v4l2sl_mdp3_claim(struct v4l2sl_context *ctx);
 
 /* Per-context state (one decode session) */
 struct v4l2sl_context {
@@ -568,6 +581,9 @@ void v4l2sl_mdp3_fini(struct v4l2sl_context *ctx);
  * the session. ALWAYS takes ownership of both fds, success or failure. */
 int v4l2sl_gpu_detile(struct v4l2sl_surface *s, int y_fd, int uv_fd);
 int v4l2sl_gpu_usable(void);
+/* True when the GPU de-tile can actually be brought up here. Runs the EGL and
+ * shader init on the GL thread once, so choosing a tier does not assume it. */
+int v4l2sl_gpu_probe(void);
 /* Wait for an outstanding GPU write to this surface's bo. Needed only before
  * the CPU touches the pixels (memfd refill, destroy); the display handoff is
  * ordered by the GPU queue and must not block. */
