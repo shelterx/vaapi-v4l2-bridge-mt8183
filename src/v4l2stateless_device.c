@@ -1551,8 +1551,12 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
 
         /*
          * Hardware de-tiles read the capture buffer through dma-bufs, so the
-         * decoder planes are exported here and the worker never issues ioctls
-         * on the decoder fd while the next frame is being decoded.
+         * decoder planes are exported here and the worker issues no ioctls on
+         * the decoder fd while the next frame is being decoded - with one
+         * exception: if the hardware job fails, the worker maps that capture
+         * slot (v4l2sl_capture_cpu_view) to redo the frame in software, since
+         * the frame was already reported as decoded. That mapping is
+         * serialised per context and only happens on the failure path.
          *
          * GPU: the shader writes the bo and the job waits on the bo's write
          * fence before anyone can sample it. A failure disables the GPU path

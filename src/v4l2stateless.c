@@ -227,6 +227,7 @@ v4l2sl_terminate(VADriverContextP ctx)
         null_capture_owner(driver_data, context);
         free(context->device_path);
         free(context->render_targets);
+        pthread_mutex_destroy(&context->cap_map_lock);
         free(context);
     }
     /* Clients that terminate without destroying their surfaces (session
@@ -1134,6 +1135,13 @@ v4l2sl_create_context(VADriverContextP ctx,
     struct v4l2sl_context *context = calloc(1, sizeof(*context));
     if (!context)
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    /* Serialises the lazy capture-slot mapping between the decode thread and
+     * the async de-tile worker. A zeroed mutex happens to work on glibc, but
+     * that is not something to rely on. */
+    if (pthread_mutex_init(&context->cap_map_lock, NULL) != 0) {
+        free(context);
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
 
     pthread_mutex_lock(&g_v4l2sl_lock);
 
@@ -1145,6 +1153,7 @@ v4l2sl_create_context(VADriverContextP ctx,
     context->request_fd = -1;
     context->render_targets = calloc(num_render_targets, sizeof(VASurfaceID));
     if (!context->render_targets) {
+        pthread_mutex_destroy(&context->cap_map_lock);
         free(context);
         pthread_mutex_unlock(&g_v4l2sl_lock);
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
@@ -1160,6 +1169,7 @@ v4l2sl_create_context(VADriverContextP ctx,
     if (!config) {
         pthread_mutex_unlock(&g_v4l2sl_lock);
         free(context->render_targets);
+        pthread_mutex_destroy(&context->cap_map_lock);
         free(context);
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
@@ -1295,6 +1305,7 @@ fail:
     v4l2sl_release_context_device(context);
     free(context->device_path);
     free(context->render_targets);
+    pthread_mutex_destroy(&context->cap_map_lock);
     free(context);
     if (v4l2sl_debug)
         fprintf(stderr, "v4l2stateless: create_context: ret=-5 (fail)\n");
@@ -1318,6 +1329,7 @@ v4l2sl_destroy_context(VADriverContextP ctx, VAContextID context_id)
             null_capture_owner(driver_data, context);
             free(context->device_path);
             free(context->render_targets);
+            pthread_mutex_destroy(&context->cap_map_lock);
             free(context);
             pthread_mutex_unlock(&g_v4l2sl_lock);
             return VA_STATUS_SUCCESS;

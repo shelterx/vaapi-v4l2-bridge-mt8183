@@ -150,6 +150,7 @@ static struct {
     GLuint prog;
     GLint u_y, u_uv, u_tc, u_ah;
     GLuint vao;
+    GLint max_tex;          /* GL_MAX_TEXTURE_SIZE, queried once at init */
     int state;              /* 0 = uninit, 1 = ready, -1 = failed */
     struct dst_entry dst[DST_ENTRIES];
     int dst_next;
@@ -425,6 +426,7 @@ static int gpu_init_locked(void)
     g_gpu.u_tc = glGetUniformLocation(g_gpu.prog, "u_tc");
     g_gpu.u_ah = glGetUniformLocation(g_gpu.prog, "u_ah");
     glGenVertexArrays(1, &g_gpu.vao);
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &g_gpu.max_tex);
     renderer = (const char *)glGetString(GL_RENDERER);
     g_gpu.state = 1;
     fprintf(stderr, "v4l2stateless: gpu: de-tile ready on %s (GLES3)\n",
@@ -515,8 +517,6 @@ static GLuint gpu_dst_fbo(struct v4l2sl_surface *s, int bo_fd)
     return e->fbo;
 }
 
-/* Caller holds g_gpu_lock (GL thread, context current). Returns the cached
- * texture for this capture plane, importing the dma-buf once per slot. */
 /* Caller holds g_gpu_lock, on the GL thread with the context current. Returns
  * a zeroed slot: a free one if there is one, else a newly opened one while the
  * table can still grow, else (at SRC_ENTRIES_MAX) the next slot of a ring,
@@ -551,6 +551,8 @@ static struct src_entry *gpu_src_alloc_locked(void)
     return e;
 }
 
+/* Caller holds g_gpu_lock (GL thread, context current). Returns the cached
+ * texture for this capture plane, importing the dma-buf once per slot. */
 static GLuint gpu_src_texture(struct v4l2sl_context *ctx, int buf_index,
                               int plane, int fd, uint32_t width,
                               uint32_t tiles)
@@ -989,13 +991,9 @@ static int gpu_job(struct v4l2sl_surface *s, int y_fd, int uv_fd)
      * tile count exceeds the GL texture limit can't be imported; refuse the
      * job rather than fail the draw. Not a GPU fault, so it must not take the
      * one-strike HW->SW fallback. */
-    {
-        GLint max_tex = 0;
-        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
-        if (max_tex > 0 && tiles > (uint32_t)max_tex) {
-            geom = 1;
-            goto unlock;
-        }
+    if (g_gpu.max_tex > 0 && tiles > (uint32_t)g_gpu.max_tex) {
+        geom = 1;
+        goto unlock;
     }
 
     /* Delete the objects of surfaces destroyed since the last job; this is the
@@ -1015,10 +1013,14 @@ static int gpu_job(struct v4l2sl_surface *s, int y_fd, int uv_fd)
          * is a genuine import fault. The next frame re-exports and recovers,
          * so a transient miss must not trip the one-strike HW->SW fallback. */
         transient = (!ty ? y_fd < 0 : 1) && (!tu ? uv_fd < 0 : 1);
-        fprintf(stderr, "v4l2stateless: gpu: plane import failed (y=%d "
-                        "u=%d err=0x%x tid=%lu)\n",
-                y_fd, uv_fd, eglGetError(),
-                (unsigned long)pthread_self());
+        /* A no-fd miss is already reported by gpu_src_texture() through the
+         * rate-limited gpu-src-miss site; printing here too spammed once per
+         * frame while a transient miss lasted. */
+        if (!transient)
+            fprintf(stderr, "v4l2stateless: gpu: plane import failed (y=%d "
+                            "u=%d err=0x%x tid=%lu)\n",
+                    y_fd, uv_fd, eglGetError(),
+                    (unsigned long)pthread_self());
         goto release;
     }
     bo_fd = gbm_bo_get_fd(s->gbm_bo);
