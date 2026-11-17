@@ -11,7 +11,10 @@
  *   - waiting on a different context does not join it, and does not clear it;
  *   - waiting on the owning context joins it;
  *   - the result is byte-identical to the synchronous de-tile;
- *   - waiting on a NULL context is a no-op.
+ *   - waiting on a NULL context is a no-op;
+ *   - two contexts de-tiling at the same time keep their own sources, slots
+ *     and results (the per-context slot must not let one job overwrite or
+ *     complete another).
  *
  * Only the software de-tile runs here, so no GPU, decoder or display is
  * needed; without a render node (GBM bo allocation) the test skips.
@@ -48,6 +51,32 @@ static void ctx_init(struct v4l2sl_context *ctx)
     memset(ctx, 0, sizeof(*ctx));
     pthread_mutex_init(&ctx->adetile.lock, NULL);
     pthread_mutex_init(&ctx->cap_map_lock, NULL);
+}
+
+struct worker {
+    struct v4l2sl_context *ctx;
+    struct v4l2sl_surface *surf;
+    const uint8_t *ysrc;
+    const uint8_t *usrc;
+    int iterations;
+    int bad;
+};
+
+/* Detile this context's surface repeatedly; the job slot is per context, so
+ * two of these running at once must not interfere. */
+static void *worker_main(void *p)
+{
+    struct worker *w = p;
+
+    for (int i = 0; i < w->iterations; i++) {
+        if (v4l2sl_gbm_surface_detile_async(w->surf, w->ysrc, w->usrc,
+                                            AW, AH) != 0)
+            w->bad++;
+        v4l2sl_gbm_detile_wait(w->ctx);
+        if (v4l2sl_gbm_detile_pending_for(w->surf) != 0)
+            w->bad++;
+    }
+    return NULL;
 }
 
 static void surface_init(struct v4l2sl_surface *s, struct v4l2sl_context *ctx)
@@ -136,6 +165,94 @@ int main(void)
             gbm_bo_unmap(s_ref.gbm_bo, map_r);
             gbm_bo_unmap(s_a.gbm_bo, map_a);
         }
+    }
+
+    /* Two contexts in parallel: separate sources, separate bos, separate
+     * slots. If the slot were shared, one stream's job would be joined (or
+     * its result taken) by the other and the bos would disagree with their
+     * own sources. */
+    {
+        struct v4l2sl_context pa, pb;
+        struct v4l2sl_surface sa, sb;
+        struct worker wa, wb;
+        pthread_t ta, tb;
+        uint8_t *ya = malloc(ysz), *ua = malloc(usz);
+        uint8_t *yb = malloc(ysz), *ub = malloc(usz);
+        int same = 1;
+
+        ctx_init(&pa);
+        ctx_init(&pb);
+        surface_init(&sa, &pa);
+        surface_init(&sb, &pb);
+        if (!ya || !ua || !yb || !ub || v4l2sl_gbm_surface_ensure(&sa) ||
+            v4l2sl_gbm_surface_ensure(&sb)) {
+            printf("SKIP: parallel phase needs two bos\n");
+            return SKIP;
+        }
+        for (size_t i = 0; i < ysz; i++) {
+            ya[i] = (uint8_t)(i * 3 + 1);
+            yb[i] = (uint8_t)(i * 5 + 2);
+        }
+        for (size_t i = 0; i < usz; i++) {
+            ua[i] = (uint8_t)(i * 11 + 7);
+            ub[i] = (uint8_t)(i * 17 + 9);
+        }
+        wa = (struct worker){ &pa, &sa, ya, ua, 10, 0 };
+        wb = (struct worker){ &pb, &sb, yb, ub, 10, 0 };
+        pthread_create(&ta, NULL, worker_main, &wa);
+        pthread_create(&tb, NULL, worker_main, &wb);
+        pthread_join(ta, NULL);
+        pthread_join(tb, NULL);
+        expect(wa.bad == 0 && wb.bad == 0, "parallel-no-failures");
+
+        /* Each bo must match a synchronous de-tile of its *own* source. */
+        for (int which = 0; which < 2; which++) {
+            struct v4l2sl_surface ref;
+            const uint8_t *ry = which ? yb : ya;
+            const uint8_t *ru = which ? ub : ua;
+            struct v4l2sl_surface *got = which ? &sb : &sa;
+            uint32_t sg = 0, sr = 0;
+            void *mg = NULL, *mr = NULL;
+            const uint8_t *g, *r;
+            uint32_t uv = got->bo_uv_rows ? got->bo_uv_rows : HEIGHT;
+            size_t rows = uv + (uv + 1) / 2;
+            size_t bad = 0;
+
+            surface_init(&ref, which ? &pb : &pa);
+            if (v4l2sl_gbm_surface_ensure(&ref) ||
+                v4l2sl_gbm_surface_detile_mm21(&ref, ry, ru, AW, AH) != 0) {
+                same = 0;
+                break;
+            }
+            g = gbm_bo_map(got->gbm_bo, 0, 0, WIDTH, rows,
+                           GBM_BO_TRANSFER_READ, &sg, &mg);
+            r = gbm_bo_map(ref.gbm_bo, 0, 0, WIDTH, rows,
+                           GBM_BO_TRANSFER_READ, &sr, &mr);
+            if (!g || !r) {
+                same = 0;
+                break;
+            }
+            for (size_t y = 0; y < rows; y++)
+                bad += memcmp(g + y * sg, r + y * sr,
+                              AW < sg ? AW : sg) != 0;
+            gbm_bo_unmap(ref.gbm_bo, mr);
+            gbm_bo_unmap(got->gbm_bo, mg);
+            v4l2sl_gbm_surface_destroy(&ref);
+            if (bad)
+                same = 0;
+        }
+        expect(same, "parallel-results-match-own-source");
+
+        v4l2sl_gbm_surface_destroy(&sa);
+        v4l2sl_gbm_surface_destroy(&sb);
+        pthread_mutex_destroy(&pa.adetile.lock);
+        pthread_mutex_destroy(&pb.adetile.lock);
+        pthread_mutex_destroy(&pa.cap_map_lock);
+        pthread_mutex_destroy(&pb.cap_map_lock);
+        free(ya);
+        free(ua);
+        free(yb);
+        free(ub);
     }
 
     free(ysrc);

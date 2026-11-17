@@ -878,34 +878,41 @@ static void *gpu_thread_main(void *arg)
     return NULL;
 }
 
+/*
+ * One dispatcher at a time. g_req carries a single job and a single "done"
+ * flag, so two contexts posting concurrently would have one of them wake on
+ * the other's completion and take g_req.rc - a good frame reported as failed
+ * (or the reverse), which shows up as constant spurious fallbacks. The GL
+ * thread is the real serialisation point anyway, so ordering the posters
+ * costs nothing. (While the async de-tile slot was global there was only ever
+ * one poster, which is why this never bit before.)
+ */
+static pthread_mutex_t g_dispatch_lock = PTHREAD_MUTEX_INITIALIZER;
+
 /* Post a job (s == NULL: a probe) to the GL thread and wait for it. Takes
  * ownership of the fds when there are any. */
 static int gpu_dispatch(struct v4l2sl_surface *s, int y_fd, int uv_fd)
 {
-    int rc;
+    int rc = -1;
 
+    pthread_mutex_lock(&g_dispatch_lock);
     pthread_mutex_lock(&g_req.lock);
     if (g_req.stopping) {
         /* fini is joining the thread: a job posted now would never run. */
         pthread_mutex_unlock(&g_req.lock);
-        goto fail;
+        goto out;
     }
     if (!g_req.started) {
         if (pthread_create(&g_req.th, NULL, gpu_thread_main, NULL) != 0) {
-            int r;
-
-            pthread_mutex_unlock(&g_req.lock);
             /* No thread: run it here rather than dropping the frame. This
-             * function owns both fds on every path, so close them here too -
-             * gpu_job() deliberately leaves them to its caller. */
-            r = gpu_job(s, y_fd, uv_fd);
-            close(y_fd);
-            close(uv_fd);
-            return r;
+             * function owns both fds on every path, so they are closed at
+             * out; gpu_job() deliberately leaves them to its caller. */
+            pthread_mutex_unlock(&g_req.lock);
+            rc = gpu_job(s, y_fd, uv_fd);
+            goto out;
         }
         g_req.started = 1;
     }
-    /* One job in flight: the caller (async worker or pull) is serialised. */
     while (g_req.posted)
         pthread_cond_wait(&g_req.done, &g_req.lock);
     g_req.s = s;
@@ -918,21 +925,17 @@ static int gpu_dispatch(struct v4l2sl_surface *s, int y_fd, int uv_fd)
         pthread_cond_wait(&g_req.done, &g_req.lock);
     rc = g_req.rc;
     pthread_mutex_unlock(&g_req.lock);
+out:
+    pthread_mutex_unlock(&g_dispatch_lock);
     if (y_fd >= 0)
         close(y_fd);
     if (uv_fd >= 0)
         close(uv_fd);
     /* A/B escape hatch: block here (not in the GL thread, which holds the
      * lock) to reproduce the pre-pipelined handoff. */
-    if (s && getenv("V4L2SL_GPU_WAIT"))
+    if (rc == 0 && s && getenv("V4L2SL_GPU_WAIT"))
         v4l2sl_gpu_wait_surface(s);
     return rc;
-fail:
-    if (y_fd >= 0)
-        close(y_fd);
-    if (uv_fd >= 0)
-        close(uv_fd);
-    return -1;
 }
 
 int v4l2sl_gpu_detile(struct v4l2sl_surface *s, int y_fd, int uv_fd)

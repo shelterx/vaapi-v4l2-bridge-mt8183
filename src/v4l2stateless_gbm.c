@@ -41,6 +41,17 @@
 
 #include "v4l2stateless.h"
 
+/*
+ * gbm_bo_map()/gbm_bo_unmap() go through the shared GBM device's DRI screen,
+ * and panfrost flushes that screen's context on the way in and out. Two
+ * threads mapping at once corrupt its batch table (seen: SIGSEGV inside
+ * panfrost_batch_init from dri_flush). With one de-tile job per context that
+ * is reachable - two software de-tiles, or one and a memfd refill - so the
+ * map/unmap pairs are serialised here. Holding the lock across the copy is
+ * deliberate: the hazard is Mesa's, not ours.
+ */
+static pthread_mutex_t g_bo_map_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static struct gbm_device *g_gbm_dev;
 static int g_gbm_fd = -1;
 static int g_gbm_failed;
@@ -104,9 +115,11 @@ int v4l2sl_gbm_surface_upload(struct v4l2sl_surface *s, const void *src,
     /* vaPutImage / sync() write the same bo a pending de-tile may be
      * writing; join first so the two never interleave. */
     v4l2sl_gbm_detile_wait(s->capture_owner);
+    pthread_mutex_lock(&g_bo_map_lock);
     dst = gbm_bo_map(s->gbm_bo, 0, 0, w, uv + (uv + 1) / 2,
                      GBM_BO_TRANSFER_WRITE, &mstride, &map_data);
     if (!dst) {
+        pthread_mutex_unlock(&g_bo_map_lock);
         fprintf(stderr, "v4l2stateless: gbm: bo map failed\n");
         return -1;
     }
@@ -115,6 +128,7 @@ int v4l2sl_gbm_surface_upload(struct v4l2sl_surface *s, const void *src,
                (const uint8_t *)src + (size_t)src_stride * src_alh,
                src_stride, w + (w & 1), (h + 1) / 2);
     gbm_bo_unmap(s->gbm_bo, map_data);
+    pthread_mutex_unlock(&g_bo_map_lock);
     return 0;
 }
 
@@ -141,13 +155,17 @@ int v4l2sl_surface_ensure_memfd(struct v4l2sl_surface *s)
     sz = v4l2sl_capture_plane_size(V4L2_PIX_FMT_NV12, s->stride, s->aligned_h);
     if (v4l2sl_surface_grow_memfd(s, sz) < 0)
         return -1;
+    pthread_mutex_lock(&g_bo_map_lock);
     bo_data = gbm_bo_map(s->gbm_bo, 0, 0, w, uv + (uv + 1) / 2,
                          GBM_BO_TRANSFER_READ, &bo_stride, &bo_map);
-    if (!bo_data)
+    if (!bo_data) {
+        pthread_mutex_unlock(&g_bo_map_lock);
         return -1;
+    }
     m = v4l2sl_surface_map_memfd(s, sz);
     if (!m) {
         gbm_bo_unmap(s->gbm_bo, bo_map);
+        pthread_mutex_unlock(&g_bo_map_lock);
         return -1;
     }
     dst = m;
@@ -159,6 +177,7 @@ int v4l2sl_surface_ensure_memfd(struct v4l2sl_surface *s)
         memcpy(dst + (size_t)s->stride * y,
                bo_data + (size_t)bo_stride * (uv + y), uvw);
     gbm_bo_unmap(s->gbm_bo, bo_map);
+    pthread_mutex_unlock(&g_bo_map_lock);
     s->last_writer = V4L2SL_WRITER_MEMFD;
     return 0;
 }
@@ -560,12 +579,16 @@ int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
 
     if (!s || !s->gbm_bo || !ysrc || !usrc)
         return -1;
+    pthread_mutex_lock(&g_bo_map_lock);
     dst = gbm_bo_map(s->gbm_bo, 0, 0, w, uv + (uv + 1) / 2,
                      GBM_BO_TRANSFER_WRITE, &mstride, &map_data);
-    if (!dst)
+    if (!dst) {
+        pthread_mutex_unlock(&g_bo_map_lock);
         return -1;
+    }
     if (aw > mstride) {   /* capture stride wider than the bo: fall back */
         gbm_bo_unmap(s->gbm_bo, map_data);
+        pthread_mutex_unlock(&g_bo_map_lock);
         return -1;
     }
     detile_planes_to(ysrc, usrc, dst, mstride,
@@ -581,6 +604,7 @@ int v4l2sl_gbm_surface_detile_mm21(struct v4l2sl_surface *s,
             memcpy(dst + (size_t)mstride * (uv + y), ulast, w);
     }
     gbm_bo_unmap(s->gbm_bo, map_data);
+    pthread_mutex_unlock(&g_bo_map_lock);
     return 0;
 }
 
