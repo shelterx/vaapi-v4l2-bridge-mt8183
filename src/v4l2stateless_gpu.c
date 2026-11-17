@@ -131,7 +131,16 @@ struct src_entry {
     EGLImageKHR img;
     GLuint tex;
 };
-#define SRC_ENTRIES 80
+/* One entry per (context, capture slot, plane): a stream with a 24-buffer pool
+ * needs 48, so two or three streams need 96-144 and a fixed 80 thrashed (every
+ * miss evicted another stream's live entry). The table starts at
+ * SRC_ENTRIES_INIT and grows in SRC_ENTRIES_GROW steps while every slot is
+ * taken, up to SRC_ENTRIES_MAX (four full-size pools). Entries are only
+ * created for live capture slots and are tombstoned when a pool dies, so
+ * demand, not the number of frames, bounds the table. */
+#define SRC_ENTRIES_INIT 80
+#define SRC_ENTRIES_GROW 16
+#define SRC_ENTRIES_MAX  (4 * 2 * V4L2SL_MAX_CAPTURE_BUFS)
 
 static struct {
     EGLDisplay dpy;
@@ -144,8 +153,9 @@ static struct {
     int state;              /* 0 = uninit, 1 = ready, -1 = failed */
     struct dst_entry dst[DST_ENTRIES];
     int dst_next;
-    struct src_entry src[SRC_ENTRIES];
-    int src_next;
+    struct src_entry src[SRC_ENTRIES_MAX];
+    int src_cap;            /* slots in use: 0 until the first import */
+    int src_next;           /* eviction cursor, only used at SRC_ENTRIES_MAX */
 } g_gpu;
 
 static pthread_mutex_t g_gpu_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -440,7 +450,7 @@ static void gpu_sweep_dead_locked(void)
             g_destroy_image(g_gpu.dpy, e->img);
         memset(e, 0, sizeof(*e));
     }
-    for (int i = 0; i < SRC_ENTRIES; i++) {
+    for (int i = 0; i < g_gpu.src_cap; i++) {
         struct src_entry *e = &g_gpu.src[i];
 
         if (e->ctx || (!e->tex && e->img == EGL_NO_IMAGE_KHR))
@@ -507,6 +517,40 @@ static GLuint gpu_dst_fbo(struct v4l2sl_surface *s, int bo_fd)
 
 /* Caller holds g_gpu_lock (GL thread, context current). Returns the cached
  * texture for this capture plane, importing the dma-buf once per slot. */
+/* Caller holds g_gpu_lock, on the GL thread with the context current. Returns
+ * a zeroed slot: a free one if there is one, else a newly opened one while the
+ * table can still grow, else (at SRC_ENTRIES_MAX) the next slot of a ring,
+ * whose old objects are deleted here. */
+static struct src_entry *gpu_src_alloc_locked(void)
+{
+    struct src_entry *e;
+
+    if (!g_gpu.src_cap)
+        g_gpu.src_cap = SRC_ENTRIES_INIT;
+    for (;;) {
+        for (int i = 0; i < g_gpu.src_cap; i++) {
+            e = &g_gpu.src[i];
+            if (!e->ctx && !e->tex && e->img == EGL_NO_IMAGE_KHR) {
+                memset(e, 0, sizeof(*e));
+                return e;
+            }
+        }
+        if (g_gpu.src_cap >= SRC_ENTRIES_MAX)
+            break;
+        g_gpu.src_cap += SRC_ENTRIES_GROW;
+        if (g_gpu.src_cap > SRC_ENTRIES_MAX)
+            g_gpu.src_cap = SRC_ENTRIES_MAX;
+    }
+    e = &g_gpu.src[g_gpu.src_next];
+    g_gpu.src_next = (g_gpu.src_next + 1) % g_gpu.src_cap;
+    if (e->tex)
+        glDeleteTextures(1, &e->tex);
+    if (e->img != EGL_NO_IMAGE_KHR)
+        g_destroy_image(g_gpu.dpy, e->img);
+    memset(e, 0, sizeof(*e));
+    return e;
+}
+
 static GLuint gpu_src_texture(struct v4l2sl_context *ctx, int buf_index,
                               int plane, int fd, uint32_t width,
                               uint32_t tiles)
@@ -515,7 +559,7 @@ static GLuint gpu_src_texture(struct v4l2sl_context *ctx, int buf_index,
 
     if (!ctx || buf_index < 0)
         return 0;
-    for (int i = 0; i < SRC_ENTRIES; i++) {
+    for (int i = 0; i < g_gpu.src_cap; i++) {
         struct src_entry *c = &g_gpu.src[i];
 
         if (c->ctx == ctx && c->buf_index == buf_index &&
@@ -533,15 +577,7 @@ static GLuint gpu_src_texture(struct v4l2sl_context *ctx, int buf_index,
                                plane, buf_index);
             return 0;
         }
-        /* Reuse the next slot; we are on the GL thread with the context
-         * current, so its old objects can be deleted immediately. */
-        e = &g_gpu.src[g_gpu.src_next];
-        g_gpu.src_next = (g_gpu.src_next + 1) % SRC_ENTRIES;
-        if (e->tex)
-            glDeleteTextures(1, &e->tex);
-        if (e->img != EGL_NO_IMAGE_KHR)
-            g_destroy_image(g_gpu.dpy, e->img);
-        memset(e, 0, sizeof(*e));
+        e = gpu_src_alloc_locked();
         e->ctx = ctx;
         e->buf_index = buf_index;
         e->plane = plane;
@@ -780,7 +816,7 @@ static void gpu_teardown_gl(void)
             g_destroy_image(g_gpu.dpy, e->img);
         memset(e, 0, sizeof(*e));
     }
-    for (int i = 0; i < SRC_ENTRIES; i++) {
+    for (int i = 0; i < SRC_ENTRIES_MAX; i++) {
         struct src_entry *e = &g_gpu.src[i];
 
         if (e->tex)
@@ -1083,7 +1119,7 @@ int v4l2sl_gpu_sources_ready(struct v4l2sl_context *ctx, int buf_index,
     tiles = (stride / 16) * (aligned_h / 32);
     pthread_mutex_lock(&g_gpu_lock);
     for (int plane = 0; plane < 2; plane++) {
-        for (int i = 0; i < SRC_ENTRIES; i++) {
+        for (int i = 0; i < g_gpu.src_cap; i++) {
             struct src_entry *e = &g_gpu.src[i];
 
             if (e->ctx == ctx && e->buf_index == buf_index &&
@@ -1127,7 +1163,7 @@ void v4l2sl_gpu_forget_capture(struct v4l2sl_context *ctx)
     if (!ctx)
         return;
     pthread_mutex_lock(&g_gpu_lock);
-    for (int i = 0; i < SRC_ENTRIES; i++) {
+    for (int i = 0; i < g_gpu.src_cap; i++) {
         struct src_entry *e = &g_gpu.src[i];
 
         if (e->ctx == ctx)
