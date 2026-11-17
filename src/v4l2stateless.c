@@ -1151,6 +1151,7 @@ v4l2sl_create_context(VADriverContextP ctx,
     context->height = picture_height;
     context->num_render_targets = num_render_targets;
     context->request_fd = -1;
+    context->detile = v4l2sl_detile_mode();
     context->render_targets = calloc(num_render_targets, sizeof(VASurfaceID));
     if (!context->render_targets) {
         pthread_mutex_destroy(&context->cap_map_lock);

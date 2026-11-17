@@ -209,6 +209,17 @@ struct v4l2sl_mdp3 {
     int streaming;
 };
 
+/* Which de-tile implementation to use (V4L2SL_DETILE). Parsed in exactly one
+ * place so the bo layout, the pull dispatch and the log messages cannot
+ * disagree: a mismatch between them writes chroma at the wrong plane offset.
+ * sw is the default; unrecognised values fall back to it. */
+enum v4l2sl_detile_mode {
+    V4L2SL_DETILE_SW = 0,
+    V4L2SL_DETILE_MDP3,
+    V4L2SL_DETILE_GPU,
+};
+enum v4l2sl_detile_mode v4l2sl_detile_mode(void);
+
 /* Per-context state (one decode session) */
 struct v4l2sl_context {
     VAContextID context_id;
@@ -318,6 +329,11 @@ struct v4l2sl_context {
     struct v4l2sl_m2m_state jpeg_q;
     /* MDP3 m2m HW de-tile (MM21 -> NV12); see v4l2sl_mdp3. */
     struct v4l2sl_mdp3 mdp3;
+    /* De-tile implementation of this context, fixed at creation from
+     * v4l2sl_detile_mode(). Every per-frame decision reads this, not the
+     * global, so a context can later pick its own tier. Until then every
+     * context gets the process-wide mode and nothing changes. */
+    enum v4l2sl_detile_mode detile;
 };
 
 /* Driver global state */
@@ -530,18 +546,6 @@ int v4l2sl_submit_request(int request_fd);
  * directions + drop the plane mappings). Safe no-op on an unused queue;
  * call before the context's device fd goes away. */
 void v4l2sl_m2m_teardown(struct v4l2sl_context *ctx, struct v4l2sl_m2m_state *q);
-/* Which de-tile implementation to use (V4L2SL_DETILE). Parsed in exactly one
- * place so the bo layout, the pull dispatch and the log messages cannot
- * disagree: a mismatch between them writes chroma at the wrong plane offset.
- * sw is the default; unrecognised values fall back to it. */
-enum v4l2sl_detile_mode {
-    V4L2SL_DETILE_SW = 0,
-    V4L2SL_DETILE_MDP3,
-    V4L2SL_DETILE_GPU,
-};
-enum v4l2sl_detile_mode v4l2sl_detile_mode(void);
-/* True in MDP3 mode only. */
-int v4l2sl_mdp3_requested(void);
 /* MDP3 m2m HW de-tile (v4l2stateless_mdp3.c). init returns 0 if the HW path
  * is ready (node found, MM21-out/NV12-cap queues configured + streaming) or
  * -1 (the software de-tile is used instead). detile imports the MM21 capture

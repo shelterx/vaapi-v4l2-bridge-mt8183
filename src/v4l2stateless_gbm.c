@@ -170,6 +170,10 @@ int v4l2sl_surface_ensure_memfd(struct v4l2sl_surface *s)
  *
  * The software path keeps the visible layout (UV at stride*height), so its
  * behaviour — and every buffer already handed to Chromium — is unchanged. */
+/* Still the process-wide mode, not a context's: the bo layout is fixed when
+ * the surface is created, before any context owns it. Both hardware tiers
+ * write the same aligned layout, so this stays correct while every context
+ * runs the global mode; a mixed hw/gpu/sw setup has to revisit it. */
 static int hw_layout_requested(void)
 {
     return v4l2sl_detile_mode() != V4L2SL_DETILE_SW;
@@ -365,8 +369,10 @@ static void *async_detile_main(void *arg)
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c0);
     if (a->hw) {
         /* Both hardware jobs take the decoder planes as dma-bufs and hand
-         * back a complete bo; only the engine differs. */
-        if (v4l2sl_detile_mode() == V4L2SL_DETILE_GPU)
+         * back a complete bo; only the engine differs. a->ctx is non-NULL for
+         * every hardware job: v4l2sl_gbm_detile_async_hw() rejects a NULL
+         * context, and this is the only producer of a->hw jobs. */
+        if (a->ctx->detile == V4L2SL_DETILE_GPU)
             a->ok = v4l2sl_gpu_detile(a->surf, a->y_fd, a->uv_fd) == 0;
         else
             a->ok = v4l2sl_mdp3_detile_prepared(a->ctx, a->surf,

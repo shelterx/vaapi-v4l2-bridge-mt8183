@@ -120,16 +120,10 @@ static int mdp3_log(void)
     return e && e[0] && e[0] != '0';
 }
 
-/* MDP3 is opt-in: with cacheable (non-coherent) capture buffers the software
- * de-tile is ~1.8 ms/frame at 1080p, while the m2m job is ~10 ms plus a
- * readback copy from uncached CMA — the HW path is ~10x slower per frame.
- * True when the caller asked for the MDP3 de-tile (V4L2SL_DETILE=hw),
- * regardless of whether init has run yet. */
-int v4l2sl_mdp3_requested(void)
-{
-    return v4l2sl_detile_mode() == V4L2SL_DETILE_MDP3;
-}
-
+/* MDP3 is opt-in (V4L2SL_DETILE=hw): with cacheable capture buffers the
+ * software de-tile is ~1.8 ms/frame at 1080p, while the m2m job is ~10 ms plus
+ * a readback copy from uncached CMA - the HW path is ~10x slower per frame.
+ * It wins on CPU (0.7 ms/job) and on pacing, not on latency. */
 static int mdp3_stream(int fd, uint32_t type, int on)
 {
     uint32_t t = type;   /* STREAMON/OFF take a pointer to a __u32 */
@@ -322,9 +316,9 @@ static int mdp3_init_locked(struct v4l2sl_context *ctx, int width, int height)
             return -1;
         }
     }
-    if (!v4l2sl_mdp3_requested()) {
+    if (ctx->detile != V4L2SL_DETILE_MDP3) {
         ctx->mdp3.disabled = 1;
-        if (v4l2sl_detile_mode() == V4L2SL_DETILE_GPU)
+        if (ctx->detile == V4L2SL_DETILE_GPU)
             fprintf(stderr,
                     "v4l2stateless: de-tile path = SW (MDP3 not selected)\n");
         else

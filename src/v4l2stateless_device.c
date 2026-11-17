@@ -1371,7 +1371,7 @@ int v4l2sl_queue_capture(struct v4l2sl_context *ctx, int buf_index,
 
     /* The GPU de-tile reads this capture slot through dma-bufs after the
      * worker thread has returned; the decoder must not refill it yet. */
-    if (v4l2sl_detile_mode() == V4L2SL_DETILE_GPU)
+    if (ctx->detile == V4L2SL_DETILE_GPU)
         v4l2sl_gpu_wait_capture(ctx, buf_index);
 
     if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
@@ -1535,8 +1535,8 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
      */
     hw_try = (fcc == V4L2_PIX_FMT_MM21) && surf->gbm_bo &&
              !ctx->mdp3.disabled &&
-             (v4l2sl_mdp3_requested() ||
-              (v4l2sl_detile_mode() == V4L2SL_DETILE_GPU &&
+             (ctx->detile == V4L2SL_DETILE_MDP3 ||
+              (ctx->detile == V4L2SL_DETILE_GPU &&
                v4l2sl_gpu_usable()));
     if (!hw_try) {
         if (v4l2sl_mmap_one_capture(ctx, buf_index) < 0)
@@ -1586,7 +1586,7 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
          * for the session and the software de-tile below rewrites the bo.
          */
         if (surf->gbm_bo && !ctx->mdp3.disabled &&
-            v4l2sl_detile_mode() == V4L2SL_DETILE_GPU &&
+            ctx->detile == V4L2SL_DETILE_GPU &&
             v4l2sl_gpu_usable()) {
             /*
              * GPU de-tile: same dma-buf handoff as MDP3, different engine.
@@ -1641,7 +1641,7 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
          * for the session and the software de-tile below takes over.
          */
         if (surf->gbm_bo && !ctx->mdp3.disabled &&
-            v4l2sl_detile_mode() != V4L2SL_DETILE_GPU) {
+            ctx->detile != V4L2SL_DETILE_GPU) {
             if (!ctx->mdp3.active) {
                 ctx->mdp3.active = 1; /* init attempted */
                 if (v4l2sl_mdp3_init(ctx, (int)stride, (int)alh) < 0)
