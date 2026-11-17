@@ -1556,7 +1556,18 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
      * this path will not touch, so defer it until the software de-tile is
      * actually needed (hardware disabled, failed, or a non-MM21 format).
      */
-    hw_try = (fcc == V4L2_PIX_FMT_MM21) && surf->gbm_bo &&
+    /*
+     * Both hardware writers place the UV plane at the bo's bo_uv_rows and read
+     * the capture as a whole number of tiles, so they need the surface's bo to
+     * have been built for this capture geometry. It is not, when the stream
+     * changed resolution under a surface the client kept: the bo still carries
+     * the old rows. Refusing here sends the frame down the software path,
+     * which de-tiles min(height, aligned_h) rows into whatever layout the bo
+     * has - instead of posting a job that can only fail (source-cache miss,
+     * geometry refusal) and logging about it every frame.
+     */
+    int geom_ok = surf->bo_uv_rows == 0 || surf->bo_uv_rows == alh;
+    hw_try = (fcc == V4L2_PIX_FMT_MM21) && surf->gbm_bo && geom_ok &&
              !ctx->mdp3.disabled &&
              (ctx->detile == V4L2SL_DETILE_MDP3 ||
               (ctx->detile == V4L2SL_DETILE_GPU &&
@@ -1608,7 +1619,7 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
          * fence before anyone can sample it. A failure disables the GPU path
          * for the session and the software de-tile below rewrites the bo.
          */
-        if (surf->gbm_bo && !ctx->mdp3.disabled &&
+        if (surf->gbm_bo && !ctx->mdp3.disabled && geom_ok &&
             ctx->detile == V4L2SL_DETILE_GPU &&
             v4l2sl_gpu_usable()) {
             /*
@@ -1663,7 +1674,7 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
          * frame; any init failure or 3 consecutive frame failures disable it
          * for the session and the software de-tile below takes over.
          */
-        if (surf->gbm_bo && !ctx->mdp3.disabled &&
+        if (surf->gbm_bo && !ctx->mdp3.disabled && geom_ok &&
             ctx->detile != V4L2SL_DETILE_GPU) {
             if (!ctx->mdp3.active) {
                 ctx->mdp3.active = 1; /* init attempted */
@@ -2176,9 +2187,10 @@ static int v4l2sl_grow_capture_pool(struct v4l2sl_context *ctx)
     created = (int)create.count;
     if (created <= 0)
         return 0;
+    /* Record the new size first: the pool push rejects indices past it. */
+    ctx->capture_bufs_allocd = (int)create.index + created;
     for (i = 0; i < created; i++)
         v4l2sl_cap_pool_push(ctx, (int)create.index + i);
-    ctx->capture_bufs_allocd = (int)create.index + created;
     V4L2SL_LOG_LIMITED(&site_pool_grow,
                        "capture pool grew %d -> %d (asked +%d, got +%d)\n",
                        old_n, ctx->capture_bufs_allocd, want - old_n, created);

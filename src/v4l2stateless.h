@@ -451,6 +451,12 @@ static inline void v4l2sl_cap_pool_push(struct v4l2sl_context *ctx, int idx)
 
     if (!ctx || idx < 0 || idx >= V4L2SL_MAX_CAPTURE_BUFS)
         return;
+    /* A capture renegotiation reallocates the queue smaller (REQBUFS at the
+     * new geometry), so a slot index remembered by a surface that outlived it
+     * may no longer exist. Queueing it later fails with EINVAL and takes the
+     * decoder down with it, so drop indices past the current pool here. */
+    if (idx >= (int)ctx->capture_bufs_allocd)
+        return;
     if (ctx->n_free_cap >= V4L2SL_MAX_CAPTURE_BUFS)
         return;
     for (i = 0; i < ctx->n_free_cap; i++)
