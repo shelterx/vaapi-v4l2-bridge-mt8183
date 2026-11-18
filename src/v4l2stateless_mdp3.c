@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -666,6 +667,46 @@ int v4l2sl_mdp3_detile(struct v4l2sl_context *ctx, int buf_index,
     return v4l2sl_mdp3_detile_prepared(ctx, surf, y_fd, uv_fd);
 }
 
+/*
+ * The claim below is per process, the m2m engine is not: two applications that
+ * each run one stream would both take it and halve each other's frame rate
+ * (measured, two mpv instances: 52 fps each instead of 60). Arbitrate across
+ * processes with a lock file in the runtime dir. The lock lives as long as the
+ * claiming process holds the fd, so it cannot be leaked by a crash, and it is
+ * released in v4l2sl_mdp3_fini() when the claiming context goes away.
+ */
+#define MDP3_CLAIM_NO_FILE (-2)   /* no runtime dir: keep per-process order */
+
+static int g_mdp3_claim_fd = -1;
+
+static int mdp3_claim_open(void)
+{
+    const char *dir = getenv("XDG_RUNTIME_DIR");
+    char path[256];
+    int fd;
+
+    if (!dir || !dir[0])
+        dir = "/tmp";
+    snprintf(path, sizeof(path), "%s/v4l2stateless-mdp3.claim", dir);
+    fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return MDP3_CLAIM_NO_FILE;
+    if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+        close(fd);
+        return -1;            /* another process is using the engine */
+    }
+    return fd;
+}
+
+/* g_mdp3_lock held. */
+static int mdp3_claim_take(void)
+{
+    if (g_mdp3_claim_fd >= 0 || g_mdp3_claim_fd == MDP3_CLAIM_NO_FILE)
+        return 1;
+    g_mdp3_claim_fd = mdp3_claim_open();
+    return g_mdp3_claim_fd >= 0 || g_mdp3_claim_fd == MDP3_CLAIM_NO_FILE;
+}
+
 int v4l2sl_mdp3_claim(struct v4l2sl_context *ctx)
 {
     int got = 0;
@@ -673,9 +714,14 @@ int v4l2sl_mdp3_claim(struct v4l2sl_context *ctx)
     if (!ctx)
         return 0;
     pthread_mutex_lock(&g_mdp3_lock);
-    if (!g_mdp3_claim || g_mdp3_claim == ctx) {
+    if (g_mdp3_claim == ctx) {
+        got = 1;
+    } else if (!g_mdp3_claim && mdp3_claim_take()) {
         g_mdp3_claim = ctx;
         got = 1;
+    } else {
+        fprintf(stderr, "v4l2stateless: de-tile hw: mdp3 already in use, "
+                        "this process takes the gpu\n");
     }
     pthread_mutex_unlock(&g_mdp3_lock);
     return got;
@@ -684,8 +730,12 @@ int v4l2sl_mdp3_claim(struct v4l2sl_context *ctx)
 void v4l2sl_mdp3_fini(struct v4l2sl_context *ctx)
 {
     pthread_mutex_lock(&g_mdp3_lock);
-    if (ctx && g_mdp3_claim == ctx)
+    if (ctx && g_mdp3_claim == ctx) {
         g_mdp3_claim = NULL;
+        if (g_mdp3_claim_fd >= 0)
+            close(g_mdp3_claim_fd);
+        g_mdp3_claim_fd = -1;
+    }
     if (ctx && g_mdp3.fd >= 0 && g_mdp3_owner == ctx) {
         mdp3_release_locked();
         /* Safe here and only here: the caller has already joined the async
