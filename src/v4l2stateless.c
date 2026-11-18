@@ -44,6 +44,11 @@ int v4l2sl_debug;
 /* Failure-log registry (see v4l2sl_logsite.h). Sites in every translation
  * unit register themselves at load time; the exit summary loops over this. */
 struct v4l2sl_logsite *g_v4l2sl_logsites[V4L2SL_MAX_LOGSITES];
+
+/* A client that keeps handing us undecodable pictures would otherwise print
+ * this from the decode thread at frame rate. */
+V4L2SL_LOGSITE(site_translate_failed, "translate-failed");
+V4L2SL_LOGSITE_REG(site_translate_failed);
 int g_v4l2sl_nlogsites;
 
 void v4l2sl_logsite_summary(void)
@@ -1796,7 +1801,8 @@ v4l2sl_end_picture(VADriverContextP ctx,
     }
 
     if (va_status != VA_STATUS_SUCCESS) {
-        fprintf(stderr, "v4l2stateless: decode translate failed: %d\n", va_status);
+        V4L2SL_LOG_LIMITED(&site_translate_failed,
+                           "decode translate failed: %d\n", va_status);
         /* Clean up and return */
         context->current_surface->status = VASurfaceSkipped;
         context->current_surface = NULL;

@@ -42,6 +42,8 @@ V4L2SL_LOGSITE(site_pool_grow_failed, "pool-grow-failed");
 V4L2SL_LOGSITE_REG(site_pool_grow_failed);
 V4L2SL_LOGSITE(site_decode_error, "decode-error");
 V4L2SL_LOGSITE_REG(site_decode_error);
+V4L2SL_LOGSITE(site_no_cap_buf, "no-capture-buffer");
+V4L2SL_LOGSITE_REG(site_no_cap_buf);
 
 /* filled by decode_submit, consumed by the matching pull_capture */
 static double g_prof_pending_decode = -1;
@@ -695,7 +697,8 @@ static int decode_submit_inner(struct v4l2sl_context *ctx, int out_buf_idx,
         cap_buf_idx = ctx->current_surface->buf_index;
     if (cap_buf_idx < 0) {
         if (ctx->n_free_cap == 0) {
-            fprintf(stderr, "v4l2stateless: no free capture buffer\n");
+            V4L2SL_LOG_LIMITED(&site_no_cap_buf,
+                               "no free capture buffer\n");
 
             v4l2sl_out_pool_push(ctx, out_buf_idx);
             return -1;
