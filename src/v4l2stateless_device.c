@@ -62,8 +62,9 @@ enum v4l2sl_detile_mode v4l2sl_detile_mode(void)
 {
     const char *e = getenv("V4L2SL_DETILE");
 
+    /* Unset: hw if this box has it, gpu for any further stream, sw last. */
     if (!e || !e[0])
-        return V4L2SL_DETILE_SW;
+        return V4L2SL_DETILE_AUTO;
     if (e[0] == 'h' || e[0] == 'H')
         return V4L2SL_DETILE_MDP3;
     if (e[0] == 'g' || e[0] == 'G')
@@ -79,7 +80,10 @@ enum v4l2sl_detile_mode v4l2sl_detile_resolve(struct v4l2sl_context *ctx)
 
     if (m != V4L2SL_DETILE_AUTO)
         return m;
-    if (v4l2sl_mdp3_claim(ctx)) {
+    /* Claiming the MDP3 is bookkeeping; the node has to exist as well, or the
+     * first stream would be given a tier it cannot use and fall to the CPU
+     * instead of the GPU it could have had. */
+    if (v4l2sl_mdp3_probe() && v4l2sl_mdp3_claim(ctx)) {
         m = V4L2SL_DETILE_MDP3;
         fprintf(stderr, "v4l2stateless: de-tile tier = hw (auto, MDP3 claimed)\n");
         return m;
@@ -1566,6 +1570,21 @@ static int pull_capture_inner(struct v4l2sl_context *ctx,
      * has - instead of posting a job that can only fail (source-cache miss,
      * geometry refusal) and logging about it every frame.
      */
+    /*
+     * Tier ladder: hw -> gpu -> sw. When MDP3 gives up mid-session (firmware
+     * that cannot run a job, a wedged m2m) the context goes to the GPU, not
+     * straight to the CPU: same class of engine, and the frame that failed has
+     * already been redone in software below. Only the next frame picks this up.
+     */
+    if (ctx->detile == V4L2SL_DETILE_MDP3 && ctx->mdp3.disabled) {
+        if (v4l2sl_gpu_usable()) {
+            ctx->detile = V4L2SL_DETILE_GPU;
+            fprintf(stderr, "v4l2stateless: de-tile tier hw->gpu (mdp3 gave up)\n");
+        } else {
+            ctx->detile = V4L2SL_DETILE_SW;
+            fprintf(stderr, "v4l2stateless: de-tile tier hw->sw (mdp3 gave up)\n");
+        }
+    }
     int geom_ok = surf->bo_uv_rows == 0 || surf->bo_uv_rows == alh;
     hw_try = (fcc == V4L2_PIX_FMT_MM21) && surf->gbm_bo && geom_ok &&
              !ctx->mdp3.disabled &&

@@ -266,6 +266,27 @@ static int mdp3_open_node(char *path_out, size_t sz)
     return -1;
 }
 
+/* Does this box have an mdp3 m2m node at all? A board without the VPU, or a
+ * kernel built without mtk-mdp3, must not cost the first stream its tier: the
+ * claim is only bookkeeping. Firmware that opens but cannot run a job is a
+ * different failure, caught per frame and stepped down to the GPU. */
+int v4l2sl_mdp3_probe(void)
+{
+    static int state = -1;   /* -1 unknown, 0 absent, 1 present */
+    char path[32];
+    int fd;
+
+    if (state >= 0)
+        return state;
+    fd = mdp3_open_node(path, sizeof(path));
+    state = fd >= 0;
+    if (fd >= 0)
+        close(fd);
+    fprintf(stderr, "v4l2stateless: de-tile hw probe: mdp3 %s\n",
+            state ? "present" : "absent");
+    return state;
+}
+
 static int mdp3_s_fmt(int fd, uint32_t type, uint32_t fourcc,
                       uint32_t w, uint32_t h, struct v4l2_pix_format_mplane *out)
 {

@@ -41,8 +41,13 @@ int main(void)
     if (!a || !b || !c || !d)
         return 1;
 
+    /* Unset is auto: the ladder picks whatever this box can actually run. */
+    /* Unset is auto: the ladder decides per context, so nothing is claimed
+     * here - the auto cases below pin the choice it actually makes. */
+    unsetenv("V4L2SL_DETILE");
+    expect(v4l2sl_detile_mode() == V4L2SL_DETILE_AUTO, "unset-is-auto");
+
     /* Forced modes: same tier for every context, no claim taken. */
-    expect(resolve(NULL, a) == V4L2SL_DETILE_SW, "default-sw");
     expect(resolve("sw", a) == V4L2SL_DETILE_SW, "forced-sw");
     expect(resolve("gpu", a) == V4L2SL_DETILE_GPU, "forced-gpu");
     expect(resolve("hw", a) == V4L2SL_DETILE_MDP3, "forced-hw-a");

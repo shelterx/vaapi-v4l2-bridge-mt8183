@@ -101,9 +101,13 @@ You normally do not need any of these.
 # Use the CPU de-tile synchronously instead of in the background.
 V4L2SL_DETILE_ASYNC=0
 
-# Use the MDP3 hardware de-tile (works, but might be slower).
-# The firmware must also support it.
-V4L2SL_DETILE=hw
+# Default: auto. One stream gets the MDP3 hardware de-tile when this box has
+# the m2m node, any further stream gets the GPU shader, and the CPU is the
+# last resort. If the MDP3 node is missing the first stream takes the GPU
+# instead of the CPU, and if MDP3 gives up mid-session (firmware that opens but
+# cannot run a job) that stream steps down to the GPU, not to the CPU.
+# Force one tier for every stream with =hw, =gpu or =sw.
+V4L2SL_DETILE=auto
 
 # Print frame timings every 120 frames, or write them to a CSV file.
 V4L2SL_PROFILE=120

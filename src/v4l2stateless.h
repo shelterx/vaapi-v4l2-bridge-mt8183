@@ -232,6 +232,8 @@ enum v4l2sl_detile_mode v4l2sl_detile_resolve(struct v4l2sl_context *ctx);
 /* Reserve MDP3 for ctx (true if ctx now holds it or already did). Held until
  * v4l2sl_mdp3_fini(ctx), even if the hardware path later disables itself. */
 int v4l2sl_mdp3_claim(struct v4l2sl_context *ctx);
+/* 1 if an mdp3 m2m node exists (cached); does not run a job. */
+int v4l2sl_mdp3_probe(void);
 
 /*
  * One in-flight asynchronous de-tile job, per decode context.
