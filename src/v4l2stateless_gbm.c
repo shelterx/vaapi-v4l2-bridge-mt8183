@@ -343,11 +343,16 @@ void v4l2sl_gbm_detile_last_job(double *wall_ms, double *cpu_ms)
  * 15 -> 10 on a local clip). Opt out with V4L2SL_DETILE_ASYNC=0. */
 int v4l2sl_gbm_detile_async_wanted(void)
 {
-    const char *e = getenv("V4L2SL_DETILE_ASYNC");
+    /* Asked once per frame: read environ once, not every time. */
+    static int cached = -1;
 
-    if (e && (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "no")))
-        return 0;
-    return 1;
+    if (cached < 0) {
+        const char *e = getenv("V4L2SL_DETILE_ASYNC");
+
+        cached = !(e && (!strcmp(e, "0") || !strcmp(e, "off") ||
+                         !strcmp(e, "no")));
+    }
+    return cached;
 }
 
 static double ts_ms(const struct timespec *a, const struct timespec *b)

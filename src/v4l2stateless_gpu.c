@@ -56,6 +56,16 @@
 #include <drm_fourcc.h>
 #include <linux/dma-buf.h>
 #include "v4l2stateless.h"
+
+/* A/B escape hatch, read once: this is the per-frame handoff. */
+static int gpu_wait_wanted(void)
+{
+    static int cached = -1;
+
+    if (cached < 0)
+        cached = getenv("V4L2SL_GPU_WAIT") != NULL;
+    return cached;
+}
 #include "v4l2sl_logsite.h"
 
 /* Failure-log sites for this translation unit (see v4l2sl_logsite.h). */
@@ -933,7 +943,7 @@ out:
         close(uv_fd);
     /* A/B escape hatch: block here (not in the GL thread, which holds the
      * lock) to reproduce the pre-pipelined handoff. */
-    if (rc == 0 && s && getenv("V4L2SL_GPU_WAIT"))
+    if (rc == 0 && s && gpu_wait_wanted())
         v4l2sl_gpu_wait_surface(s);
     return rc;
 }
