@@ -1,70 +1,14 @@
 # Hardware Video decode for MT8183 (Mali-G72 MC3)
 
-This was developed using Chromium 155 and Firefox 158 on Debian Trixie under Wayland.  
-Firefox needs two extra environment variables to be set:  
-`MOZ_DISABLE_RDD_SANDBOX=1 MOZ_DISABLE_CONTENT_SANDBOX=1`  
-It also needs the video settings from `scripts/firefox-vaapi-user.js` (copy it
-into your Firefox profile as `user.js`).  
-**NOTE**: Firefox might have performance issues in general; use Chromium if possible.
-Chromium needs no extra configuration other than the environment variable below.  
-Vulkan renderer does NOT work, you need to use GL.  
+This was developed using Chromium 155 and Firefox 158 on Debian Trixie under Wayland. Continued development was done on Debian Sid.  
+Confirmed working on kernel 6.18.34 but the recommended kernel is 6.18.60 or above.
 
 The h264ify extension is recommended for Chromium/Firefox to get HW Acceleration on YouTube.
 
 > [!NOTE]
 > **AI TRANSPARENCY**  
 > Qwen 3.8 27b and Deepseek-4.1-Flash were used to make this possible.  
-> Human feedback and testing was done, no automation was involved in the process.  
-
-
-## REQUIRED environment variable
-
-Every VA-API client must load **this** driver, not `panfrost_drv_video.so`:
-
-```bash
-export LIBVA_DRIVER_NAME=v4l2stateless
-```
-
-Persist it for graphical sessions (systemd user environment, not only `~/.bashrc`):
-
-```bash
-# ~/.config/environment.d/90-libva.conf
-LIBVA_DRIVER_NAME=v4l2stateless
-```
-
-and/or `~/.profile`.
-
-The flow then becomes:
-
-```text
-App (Chromium / Firefox)
-  → libva
-  → v4l2stateless driver
-  → hardware decoder (/dev/video5)
-  → tiled frame (MM21)
-  → de-tile to normal NV12
-  → shared GPU buffer
-  → screen
-```
-
-Install the `.so` first (see Build / install). Check:
-
-```bash
-LIBVA_DRIVER_NAME=v4l2stateless vainfo --display drm --device /dev/dri/renderD128
-```
-
-Verify that it finds the VAProfiles:
-
-```
-vainfo: Supported profile and entrypoints
-      VAProfileH264ConstrainedBaseline: VAEntrypointVLD
-      VAProfileH264Main               : VAEntrypointVLD
-      VAProfileH264High               : VAEntrypointVLD
-      VAProfileH264High10             : VAEntrypointVLD
-      <unknown profile>               : VAEntrypointVLD
-      VAProfileJPEGBaseline           : VAEntrypointEncPicture
-      VAProfileNone                   : VAEntrypointVideoProc
-```
+> Human feedback and testing was done, no blind automation was involved in the process.
 
 ## Build / install
 
@@ -93,6 +37,69 @@ sudo cp -f builddir/v4l2stateless_drv_video.so \
   /usr/lib/aarch64-linux-gnu/dri/
 ```
 
+After installing run:
+
+```bash
+LIBVA_DRIVER_NAME=v4l2stateless vainfo --display drm --device /dev/dri/renderD128
+```
+
+Then verify that it finds the H264 VAProfiles:
+
+```
+vainfo: Supported profile and entrypoints
+      VAProfileH264ConstrainedBaseline: VAEntrypointVLD
+      VAProfileH264Main               : VAEntrypointVLD
+      VAProfileH264High               : VAEntrypointVLD
+      VAProfileH264High10             : VAEntrypointVLD
+      <unknown profile>               : VAEntrypointVLD
+      VAProfileJPEGBaseline           : VAEntrypointEncPicture
+      VAProfileNone                   : VAEntrypointVideoProc
+```
+
+## Application configuration
+
+##### **REQUIRED environment variable**:
+
+Every VA-API client must load **this** driver, not `panfrost_drv_video.so`:
+
+```bash
+export LIBVA_DRIVER_NAME=v4l2stateless
+```
+
+Persist it for graphical sessions (systemd user environment, not only `~/.bashrc`):
+
+```bash
+# ~/.config/environment.d/90-libva.conf
+LIBVA_DRIVER_NAME=v4l2stateless
+```
+
+and/or `~/.profile`.
+
+**NOTE**: Different desktop environments uses different config files, so be sure to set the env variable correct for those.
+
+##### Wayland
+
+**KDE/Gnome**:
+KWin/Mutter seems to inferfere with the compositing somehow on panfrost causing  stutter in the web browsers and some apps, it seems to be unrelated to tbe v4l2 bridge.
+
+[Wayfire](https://github.com/wayfirewm/wayfire) or [labwc](https://github.com/labwc/labwc) does not seem to have this issue, so use those or test which DE/Compositor that works best for you.
+
+An easy way to test if you have stutter is to run the [VSync Tester](https://www.vsynctester.com/) in a browser.
+
+**Chromium**:
+No special configuration needed
+
+**Firefox**:
+Firefox seem to have performance issues in general, root cause not found yet. Use a chromium based browser if possible.
+
+**mpv**:
+Start mpv with the following args:
+`mpv --vo=dmabuf-wayland --hwdec=vaapi <file.mp4>`
+
+##### X11
+
+Not supported. 
+
 ## Optional settings
 
 You normally do not need any of these.
@@ -115,6 +122,21 @@ V4L2SL_TRACE=/tmp/frames.csv
 
 # Ignore the cached device scan and look for the decoder again.
 V4L2SL_PROBE_NOCACHE=1
+```
+
+## Flow
+
+When using this bridge the flow becomes:
+
+```text
+App (Chromium / Firefox)
+  → libva
+  → v4l2stateless driver
+  → hardware decoder (/dev/video5)
+  → tiled frame (MM21)
+  → de-tile to normal NV12
+  → shared GPU buffer
+  → screen
 ```
 
 ## Folders
